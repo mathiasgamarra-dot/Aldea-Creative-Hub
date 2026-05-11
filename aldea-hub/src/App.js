@@ -55,7 +55,7 @@ async function callClaude(apiKey, system, userMsg, history = []) {
       "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 1600,
       system,
       messages: [...history, { role: "user", content: userMsg }],
