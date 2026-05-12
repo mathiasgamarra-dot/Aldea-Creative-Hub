@@ -63,6 +63,11 @@ const fb = {
   getProjects: async clientId => { try{const s=await getDocs(collection(db,"projects"));return s.docs.map(d=>({id:d.id,...d.data()})).filter(p=>p.clientId===clientId);}catch{return[];} },
   saveNote: async n => { await addDoc(collection(db,"notes"),{...n,ts:serverTimestamp()}); },
   getNotes: async projId => { try{const s=await getDocs(query(collection(db,"notes"),orderBy("ts","desc"),limit(50)));return s.docs.map(d=>({id:d.id,...d.data()})).filter(n=>n.projectId===projId);}catch{return[];} },
+  deleteClient: async id => { try{await deleteDoc(doc(db,"clients",id));}catch(e){} },
+  deleteProject: async id => { try{await deleteDoc(doc(db,"projects",id));}catch(e){} },
+  saveCampaign: async c => { await setDoc(doc(db,"campaigns",c.id),{...c,updatedAt:serverTimestamp()}); },
+  getCampaigns: async projId => { try{const s=await getDocs(collection(db,"campaigns"));return s.docs.map(d=>({id:d.id,...d.data()})).filter(c=>c.projectId===projId);}catch{return[];} },
+  deleteCampaign: async id => { try{await deleteDoc(doc(db,"campaigns",id));}catch(e){} },
   logAct: async e => { try{await addDoc(collection(db,"activity"),{...e,ts:serverTimestamp()});}catch{} },
 };
 
@@ -79,8 +84,8 @@ const ROLES = {
   produccion:{label:"Producción",  color:"var(--pink)",   icon:"◈"},
 };
 const AREAS = ["Diseño","Estrategia","Producción","Cuentas","Dirección"];
-const PROJECT_MODULES = ["Brief","Estrategia","Concepto","Medios","Tareas","Email","Archivos"];
-const MODULE_COLORS = {Brief:"var(--amber)",Estrategia:"var(--purple)",Concepto:"var(--pink)",Medios:"var(--blue)",Tareas:"var(--green)",Email:"var(--teal)",Archivos:"var(--muted2)"};
+const PROJECT_MODULES = ["Brief","Estrategia","Concepto","Campañas","Medios","Tareas","Email","Archivos"];
+const MODULE_COLORS = {Brief:"var(--amber)",Estrategia:"var(--purple)",Concepto:"var(--pink)",Campañas:"var(--accent)",Medios:"var(--blue)",Tareas:"var(--green)",Email:"var(--teal)",Archivos:"var(--muted2)"};
 
 // ── UI ATOMS ──────────────────────────────────────────────────────────────────
 const S = {
@@ -212,13 +217,16 @@ function AgentChat({user, context, onClose}) {
 }
 
 // ── CLIENT CARD ───────────────────────────────────────────────────────────────
-function ClientCard({client, onClick, projectCount=0}) {
+function ClientCard({client, onClick, projectCount=0, onDelete}) {
   const colors = ["var(--accent)","var(--purple)","var(--blue)","var(--pink)","var(--amber)","var(--teal)"];
   const color = colors[client.name.charCodeAt(0) % colors.length];
   return (
-    <div onClick={onClick} className="fu" style={{...S.card,padding:0,cursor:"pointer",overflow:"hidden",transition:"border .2s"}}
-      onMouseEnter={e=>e.currentTarget.style.borderColor="var(--border3)"}
-      onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}>
+    <div className="fu" style={{...S.card,padding:0,overflow:"hidden",transition:"border .2s",position:"relative"}}
+      onMouseEnter={e=>{e.currentTarget.style.borderColor="var(--border3)";e.currentTarget.querySelector(".del-btn").style.opacity="1";}}
+      onMouseLeave={e=>{e.currentTarget.style.borderColor="var(--border)";e.currentTarget.querySelector(".del-btn").style.opacity="0";}}>
+      <button className="del-btn" onClick={e=>{e.stopPropagation();if(window.confirm(`¿Eliminar cliente "${client.name}"? Esta acción no se puede deshacer.`))onDelete(client.id);}}
+        style={{position:"absolute",top:10,right:10,background:"var(--red)22",border:"1px solid var(--red)44",color:"var(--red)",borderRadius:6,padding:"3px 7px",fontSize:11,cursor:"pointer",opacity:0,transition:"opacity .2s",zIndex:2}}>✕</button>
+      <div onClick={onClick} style={{cursor:"pointer"}}>
       <div style={{height:5,background:color}}/>
       <div style={{padding:"16px 18px"}}>
         <div style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:10}}>
@@ -237,6 +245,7 @@ function ClientCard({client, onClick, projectCount=0}) {
           <span style={{fontSize:11,color:"var(--muted)"}}>📋 {projectCount} proyecto{projectCount!==1?"s":""}</span>
           {client.status&&<Tag color={client.status==="activo"?"var(--green)":client.status==="prospecto"?"var(--amber)":"var(--muted2)"} small>{client.status}</Tag>}
         </div>
+      </div>
       </div>
     </div>
   );
@@ -308,6 +317,7 @@ function ModulePanel({mod, project, client, user, asanaData, onClose}) {
 
   const SYS_MOD = {
     Brief: `Sos estratega de agencia 360. Dado un brief, extraé: cliente, objetivo, target, presupuesto, canales, plazo, tono, insight, KPIs. Respondé en formato claro con secciones.`,
+    "Campañas": `Sos director creativo de agencia 360 argentina. Cliente: ${client?.name}. Ayudás a desarrollar campañas publicitarias completas con concepto, piezas, plan de medios y KPIs.`,
     Estrategia: `Sos estratega creativo de agencia 360 argentina. Cliente: ${client?.name}. Proyecto: ${project?.name}. Brief: ${project?.modules?.Brief||"No disponible"}. Proponé insight central + 3 territorios creativos distintos + pregunta clave.`,
     Concepto: `Sos director creativo de agencia 360 argentina. Cliente: ${client?.name}. Brief: ${project?.modules?.Brief||""}. Estrategia: ${project?.modules?.Estrategia||""}. Desarrollá el concepto creativo: nombre de campaña, idea central, tagline, y guía de tono visual.`,
     Medios: `Sos especialista en medios y performance. Cliente: ${client?.name}. Objetivo: ${project?.modules?.Brief||""}. Recomendá plan de medios: canales, distribución de presupuesto %, formatos por canal, KPIs y cronograma.`,
@@ -415,6 +425,11 @@ function ModulePanel({mod, project, client, user, asanaData, onClose}) {
           <div style={{fontSize:12.5,color:"var(--muted2)"}}>Pegá un email del cliente en el chat del agente ↓ y lo clasifico y redacto la respuesta.</div>
         )}
 
+        {/* Campañas view - handled by CampaignsPanel */}
+        {mod==="Campañas" && (
+          <CampaignsPanel project={project} client={client} user={user}/>
+        )}
+
         {/* Archivos view */}
         {mod==="Archivos" && (
           <div style={{border:"2px dashed var(--border2)",borderRadius:10,padding:24,textAlign:"center",color:"var(--muted)"}}>
@@ -452,6 +467,143 @@ function ModulePanel({mod, project, client, user, asanaData, onClose}) {
           style={{...S.inp,flex:1,fontSize:12,padding:"7px 10px"}}
           onKeyDown={e=>e.key==="Enter"&&send()}/>
         <button onClick={()=>send()} disabled={loading||!input.trim()} style={{...S.btnP(),padding:"7px 12px",opacity:(!input.trim()||loading)?.35:1}}>→</button>
+      </div>
+    </div>
+  );
+}
+
+
+// ── CAMPAIGNS PANEL ───────────────────────────────────────────────────────────
+function CampaignsPanel({project, client, user}) {
+  const [campaigns, setCampaigns] = useState([]);
+  const [showNew, setShowNew] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [openCamp, setOpenCamp] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [brief, setBrief] = useState({marca:client?.name||"",producto:"",objetivo:"",target:"",budget:"",canales:""});
+  const [step, setStep] = useState(0);
+  const [result, setResult] = useState("");
+  const FIELDS = [
+    {key:"producto",label:"¿Qué se comunica?",ph:"Ej: Lanzamiento de línea verano"},
+    {key:"objetivo",label:"¿Cuál es el objetivo?",ph:"Ej: Awareness + ventas"},
+    {key:"target",label:"¿Quién es el público?",ph:"Ej: Mujeres 25-40, urbanas"},
+    {key:"budget",label:"¿Presupuesto?",ph:"Ej: USD 5.000/mes"},
+    {key:"canales",label:"¿Qué canales?",ph:"Ej: Instagram, TikTok, Google"},
+  ];
+
+  useEffect(()=>{
+    fb.getCampaigns(project.id).then(c=>{setCampaigns(c||[]);setLoading(false);}).catch(()=>setLoading(false));
+  },[project.id]);
+
+  const createCampaign = async () => {
+    if(!newName.trim()) return;
+    const id = "camp-"+Date.now().toString(36);
+    const camp = {id,projectId:project.id,clientId:client.id,name:newName.trim(),status:"borrador",brief:{},result:"",createdAt:Date.now()};
+    await fb.saveCampaign(camp);
+    setCampaigns(p=>[camp,...p]);
+    setNewName(""); setShowNew(false);
+    setOpenCamp(camp);
+  };
+
+  const deleteCampaign = async id => {
+    if(!window.confirm("¿Eliminar esta campaña?")) return;
+    await fb.deleteCampaign(id);
+    setCampaigns(p=>p.filter(c=>c.id!==id));
+    if(openCamp?.id===id) setOpenCamp(null);
+  };
+
+  const generateCampaign = async () => {
+    setGenerating(true);
+    const SYS = `Sos director creativo de agencia 360 argentina. Cliente: ${client?.name}. Brief del proyecto: ${project?.modules?.Brief||""}. Generá una campaña completa:\n\n**CONCEPTO**\nNombre de campaña / Idea central / Tagline\n\n**PIEZAS** (4 formatos)\nFormato · copy principal · copy secundario · dirección de arte\n\n**PLAN DE MEDIOS**\nCanales con justificación + distribución %\n\n**KPIs**\n3 métricas con benchmarks`;
+    const txt = FIELDS.map(f=>`${f.key.toUpperCase()}: ${brief[f.key]||"No especificado"}`).join("\n");
+    try {
+      const r = await claude(user.apiKey, SYS, `Campaña: ${openCamp?.name}\n\nBrief:\nMARCA: ${brief.marca}\n${txt}`);
+      setResult(r);
+      const updated = {...openCamp, brief, result:r, status:"generada"};
+      await fb.saveCampaign(updated);
+      setCampaigns(p=>p.map(c=>c.id===openCamp.id?updated:c));
+      setOpenCamp(updated);
+    } catch(e) { setResult("❌ "+e.message); }
+    setGenerating(false);
+  };
+
+  if(openCamp) {
+    const hasBrief = FIELDS.every(f=>brief[f.key]);
+    return (
+      <div style={{height:"100%",display:"flex",flexDirection:"column"}}>
+        <div style={{padding:"10px 14px",borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+          <button onClick={()=>{setOpenCamp(null);setResult("");setStep(0);}} style={{background:"none",border:"none",color:"var(--muted2)",fontSize:12,cursor:"pointer"}}>← Campañas</button>
+          <span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:13,flex:1}}>{openCamp.name}</span>
+          <Tag color="var(--accent)" small>{openCamp.status||"borrador"}</Tag>
+        </div>
+        <div style={{flex:1,overflowY:"auto",padding:"14px 16px"}}>
+          {result||openCamp.result ? (
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:12}}>
+                <div style={{fontSize:11,color:"var(--accent)",fontWeight:700,textTransform:"uppercase",letterSpacing:".08em"}}>✦ Campaña generada</div>
+                <button onClick={()=>{setResult("");}} style={{...S.btnS,fontSize:11,padding:"4px 9px"}}>↺ Regenerar</button>
+              </div>
+              <div style={{background:"var(--card2)",border:"1px solid var(--border2)",borderRadius:10,padding:16,fontSize:13,lineHeight:1.75,whiteSpace:"pre-wrap"}}>{result||openCamp.result}</div>
+            </div>
+          ) : generating ? (
+            <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"60%",gap:12}}>
+              <div style={{fontSize:30,animation:"spin 2.5s linear infinite"}}>✦</div>
+              <div style={{color:"var(--muted2)",fontSize:13}}>Generando campaña...</div>
+            </div>
+          ) : (
+            <div>
+              <div style={{fontSize:12,color:"var(--muted2)",marginBottom:14}}>Completá el brief para generar la campaña. Los datos del cliente ya están pre-cargados.</div>
+              {FIELDS.map((f,i)=>(
+                <div key={f.key} style={{marginBottom:10}}>
+                  <Lbl>{f.label}</Lbl>
+                  <input value={brief[f.key]||""} onChange={e=>setBrief(p=>({...p,[f.key]:e.target.value}))} placeholder={f.ph} style={S.inp}/>
+                </div>
+              ))}
+              <button onClick={generateCampaign} disabled={!brief.producto} style={{...S.btnP(),width:"100%",marginTop:8,opacity:!brief.producto?.5:1}}>✦ Generar campaña 360</button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{height:"100%",display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"10px 14px",borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
+        <span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:13}}>🎨 Campañas</span>
+        <button onClick={()=>setShowNew(true)} style={{...S.btnP(),padding:"5px 11px",fontSize:12}}>+ Nueva</button>
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"10px 14px"}}>
+        {showNew && (
+          <div className="fu" style={{background:"var(--card2)",border:"1px solid var(--border2)",borderRadius:9,padding:12,marginBottom:10,display:"flex",gap:7}}>
+            <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="Nombre de la campaña..." style={{...S.inp,flex:1,padding:"7px 10px",fontSize:12.5}} autoFocus onKeyDown={e=>e.key==="Enter"&&createCampaign()}/>
+            <button onClick={createCampaign} disabled={!newName.trim()} style={{...S.btnP(),padding:"7px 11px",fontSize:12}}>Crear</button>
+            <button onClick={()=>setShowNew(false)} style={{...S.btnS,padding:"7px 10px",fontSize:12}}>✕</button>
+          </div>
+        )}
+        {loading ? <div style={{display:"flex",gap:8,color:"var(--muted)",padding:16,alignItems:"center"}}><Spin/>Cargando...</div>
+        : campaigns.length===0 ? (
+          <div style={{textAlign:"center",padding:"40px 10px",color:"var(--muted)"}}>
+            <div style={{fontSize:28,marginBottom:8}}>🎨</div>
+            <div style={{fontSize:13,marginBottom:10}}>No hay campañas todavía</div>
+            <button onClick={()=>setShowNew(true)} style={{...S.btnP(),padding:"7px 14px",fontSize:12}}>+ Crear campaña</button>
+          </div>
+        ) : campaigns.map(c=>(
+          <div key={c.id} className="fu" style={{background:"var(--card2)",border:"1px solid var(--border2)",borderRadius:9,padding:"11px 13px",marginBottom:7,cursor:"pointer",display:"flex",alignItems:"center",gap:10,position:"relative"}}
+            onMouseEnter={e=>e.currentTarget.querySelector(".camp-del").style.opacity="1"}
+            onMouseLeave={e=>e.currentTarget.querySelector(".camp-del").style.opacity="0"}>
+            <button className="camp-del" onClick={e=>{e.stopPropagation();deleteCampaign(c.id);}}
+              style={{position:"absolute",top:6,right:6,background:"var(--red)22",border:"1px solid var(--red)44",color:"var(--red)",borderRadius:5,padding:"1px 6px",fontSize:10,cursor:"pointer",opacity:0,transition:"opacity .2s"}}>✕</button>
+            <div onClick={()=>{setOpenCamp(c);setResult(c.result||"");setBrief(c.brief||{marca:client?.name||""});}} style={{flex:1,display:"flex",alignItems:"center",gap:10}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:c.status==="generada"?"var(--accent)":"var(--border2)",flexShrink:0}}/>
+              <div>
+                <div style={{fontSize:13.5,fontWeight:500}}>{c.name}</div>
+                <div style={{fontSize:11,color:"var(--muted2)",marginTop:2}}>{new Date(c.createdAt).toLocaleDateString("es-AR")} · {c.status||"borrador"}</div>
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -581,6 +733,11 @@ function ClientView({client, user, onBack}) {
     await fb.logAct({userId:user.id,userName:user.name,module:"proyectos",action:`Proyecto creado: ${proj.name}`});
   };
 
+  const handleDeleteProject = async id => {
+    await fb.deleteProject(id);
+    setProjects(p=>p.filter(pr=>pr.id!==id));
+  };
+
   if(openProject) return <ProjectView project={openProject} client={client} user={user} onBack={()=>setOpenProject(null)}/>;
 
   const colors = ["var(--accent)","var(--purple)","var(--blue)","var(--pink)","var(--amber)","var(--teal)"];
@@ -629,10 +786,13 @@ function ClientView({client, user, onBack}) {
               {projects.map(proj=>{
                 const pc = colors[proj.name.charCodeAt(0) % colors.length];
                 return (
-                  <div key={proj.id} onClick={()=>setOpenProject(proj)} className="fu"
-                    style={{...S.card,padding:0,cursor:"pointer",overflow:"hidden",transition:"border .2s"}}
-                    onMouseEnter={e=>e.currentTarget.style.borderColor="var(--border3)"}
-                    onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}>
+                  <div key={proj.id} className="fu"
+                    style={{...S.card,padding:0,overflow:"hidden",transition:"border .2s",position:"relative"}}
+                    onMouseEnter={e=>{e.currentTarget.style.borderColor="var(--border3)";e.currentTarget.querySelector(".proj-del").style.opacity="1";}}
+                    onMouseLeave={e=>{e.currentTarget.style.borderColor="var(--border)";e.currentTarget.querySelector(".proj-del").style.opacity="0";}}>
+                    <button className="proj-del" onClick={e=>{e.stopPropagation();if(window.confirm(`¿Eliminar proyecto "${proj.name}"?`))handleDeleteProject(proj.id);}}
+                      style={{position:"absolute",top:8,right:8,background:"var(--red)22",border:"1px solid var(--red)44",color:"var(--red)",borderRadius:6,padding:"2px 7px",fontSize:11,cursor:"pointer",opacity:0,transition:"opacity .2s",zIndex:2}}>✕</button>
+                    <div onClick={()=>setOpenProject(proj)} style={{cursor:"pointer"}}>
                     <div style={{height:4,background:pc}}/>
                     <div style={{padding:"14px 16px"}}>
                       <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,marginBottom:6}}>{proj.name}</div>
@@ -646,6 +806,7 @@ function ClientView({client, user, onBack}) {
                         <span style={{fontSize:11,color:"var(--muted)"}}>{new Date(proj.createdAt).toLocaleDateString("es-AR")}</span>
                         {proj.status&&<Tag color={proj.status==="activo"?"var(--green)":"var(--amber)"} small>{proj.status}</Tag>}
                       </div>
+                    </div>
                     </div>
                   </div>
                 );
@@ -688,6 +849,11 @@ function ClientsHub({user, onLogout}) {
     setClients(p=>[c,...p]);
     setShowNew(false);
     await fb.logAct({userId:user.id,userName:user.name,module:"clientes",action:`Cliente creado: ${c.name}`});
+  };
+
+  const handleDeleteClient = async id => {
+    await fb.deleteClient(id);
+    setClients(p=>p.filter(c=>c.id!==id));
   };
 
   if(openClient) return <ClientView client={openClient} user={user} onBack={()=>setOpenClient(null)}/>;
@@ -761,7 +927,7 @@ function ClientsHub({user, onLogout}) {
             </div>
           ) : (
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>
-              {filtered.map(c=><ClientCard key={c.id} client={c} projectCount={projCountFor(c.id)} onClick={()=>setOpenClient(c)}/>)}
+              {filtered.map(c=><ClientCard key={c.id} client={c} projectCount={projCountFor(c.id)} onClick={()=>setOpenClient(c)} onDelete={handleDeleteClient}/>)}
             </div>
           )}
         </div>
