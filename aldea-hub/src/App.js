@@ -1,29 +1,41 @@
-import { useState, useRef, useEffect } from "react";
-import { collection, doc, setDoc, getDocs, addDoc, query, orderBy, limit, serverTimestamp } from "firebase/firestore";
+import { useState, useRef, useEffect, useCallback } from "react";
+import { collection, doc, setDoc, getDocs, addDoc, deleteDoc, query, orderBy, limit, serverTimestamp, getDoc } from "firebase/firestore";
 import { db } from "./firebase";
 
-const GlobalStyles = () => (
+// ── STYLES ────────────────────────────────────────────────────────────────────
+const G = () => (
   <style>{`
     @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-    :root{--bg:#09090b;--surface:#101013;--card:#16161a;--border:#1f1f26;--border2:#2a2a34;--accent:#b8ff57;--text:#ededf0;--muted:#62626e;--muted2:#909099;--red:#ff5f5f;--blue:#5fa8ff;--amber:#ffbe4d;--green:#4dffc3;--purple:#b87cff;--pink:#ff7cc8}
-    body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif}
-    ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
-    @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-    @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+    :root{
+      --bg:#08080a;--surface:#0f0f12;--card:#151518;--card2:#1a1a1e;
+      --border:#1e1e24;--border2:#27272e;--border3:#32323a;
+      --accent:#b8ff57;--accent2:#8fcc38;
+      --text:#eeeaf0;--muted:#5a5a66;--muted2:#8a8a99;
+      --red:#ff5f5f;--blue:#5fa8ff;--amber:#ffbe4d;--green:#4dffc3;--purple:#b87cff;--pink:#ff7cc8;--teal:#4dd9ff;
+    }
+    body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;overflow:hidden;height:100vh}
+    ::-webkit-scrollbar{width:3px;height:3px}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
     @keyframes spin{to{transform:rotate(360deg)}}
-    .fu{animation:fadeUp .3s ease both}
-    textarea,input,button,select{font-family:'DM Sans',sans-serif}textarea{resize:vertical}button{cursor:pointer}
+    @keyframes slideIn{from{transform:translateX(100%)}to{transform:translateX(0)}}
+    .fu{animation:fadeUp .25s ease both}
+    .fi{animation:fadeIn .2s ease both}
+    textarea,input,button,select{font-family:'DM Sans',sans-serif}
+    textarea{resize:vertical}button{cursor:pointer}
+    input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent)!important}
   `}</style>
 );
 
 // ── CLAUDE ────────────────────────────────────────────────────────────────────
-async function callClaude(apiKey, system, userMsg, history = []) {
+async function claude(apiKey, system, msg, history = []) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-    body: JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:1500,system,messages:[...history,{role:"user",content:userMsg}]}),
+    body: JSON.stringify({model:"claude-haiku-4-5-20251001",max_tokens:1500,system,messages:[...history,{role:"user",content:msg}]}),
   });
   if (!res.ok) { const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message||`HTTP ${res.status}`); }
   return (await res.json()).content[0]?.text || "";
@@ -35,137 +47,119 @@ const AB = "https://app.asana.com/api/1.0";
 const aGet = async p => { const r = await fetch(`${AB}${p}`,{headers:{Authorization:`Bearer ${AT}`,Accept:"application/json"}}); if(!r.ok) throw new Error(`Asana ${r.status}`); return (await r.json()).data; };
 const aPost = async (p,b) => { const r = await fetch(`${AB}${p}`,{method:"POST",headers:{Authorization:`Bearer ${AT}`,"Content-Type":"application/json",Accept:"application/json"},body:JSON.stringify({data:b})}); if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e?.errors?.[0]?.message||`Asana ${r.status}`);} return (await r.json()).data; };
 const getWS = () => aGet("/workspaces");
-const getProjs = ws => aGet(`/projects?workspace=${ws}&opt_fields=gid,name`);
-const getTasks = p => aGet(`/projects/${p}/tasks?opt_fields=gid,name,completed,assignee,due_on`);
+const getProjs = ws => aGet(`/projects?workspace=${ws}&opt_fields=gid,name,created_at`);
+const getTasks = p => aGet(`/projects/${p}/tasks?opt_fields=gid,name,completed,assignee,due_on,created_at,notes`);
 const getMembers = ws => aGet(`/workspaces/${ws}/users?opt_fields=gid,name,email`);
 const createProj = (ws,name) => aPost("/projects",{name,workspace:ws,color:"light-green"});
 const createTask = (p,t) => aPost("/tasks",{name:t.name,notes:t.notes||"",projects:[p],assignee:t.assigneeGid||null,due_on:t.due_on||null});
 
 // ── FIREBASE ──────────────────────────────────────────────────────────────────
-const saveUser = async u => { const {pass,...s}=u; await setDoc(doc(db,"users",u.id),{...s,updatedAt:serverTimestamp()}); };
-const getAllUsers = async () => { try{const s=await getDocs(collection(db,"users"));return s.docs.map(d=>d.data());}catch{return[];} };
-const logAct = async e => { try{await addDoc(collection(db,"activity"),{...e,ts:serverTimestamp()});}catch{} };
-const saveConv = async (uid,mod,msgs,meta={}) => { try{await setDoc(doc(db,"conversations",`${uid}_${mod}_${Date.now()}`),{userId:uid,moduleId:mod,messages:msgs,...meta,savedAt:serverTimestamp()});}catch{} };
-const getAllConvs = async () => { try{const s=await getDocs(query(collection(db,"conversations"),orderBy("savedAt","desc"),limit(200)));return s.docs.map(d=>({id:d.id,...d.data()}));}catch{return[];} };
-const saveBrief = async b => { try{await setDoc(doc(db,"briefs",b.id),{...b,savedAt:serverTimestamp()});}catch(e){console.error(e);} };
-const getAllBriefs = async () => { try{const s=await getDocs(query(collection(db,"briefs"),orderBy("savedAt","desc"),limit(100)));return s.docs.map(d=>({id:d.id,...d.data()}));}catch{return[];} };
+const fb = {
+  saveUser: async u => { const {pass,...s}=u; await setDoc(doc(db,"users",u.id),{...s,updatedAt:serverTimestamp()}); },
+  getUsers: async () => { try{const s=await getDocs(collection(db,"users"));return s.docs.map(d=>d.data());}catch{return[];} },
+  saveClient: async c => { await setDoc(doc(db,"clients",c.id),{...c,updatedAt:serverTimestamp()}); },
+  getClients: async () => { try{const s=await getDocs(query(collection(db,"clients"),orderBy("updatedAt","desc")));return s.docs.map(d=>({id:d.id,...d.data()}));}catch{return[];} },
+  saveProject: async p => { await setDoc(doc(db,"projects",p.id),{...p,updatedAt:serverTimestamp()}); },
+  getProjects: async clientId => { try{const s=await getDocs(collection(db,"projects"));return s.docs.map(d=>({id:d.id,...d.data()})).filter(p=>p.clientId===clientId);}catch{return[];} },
+  saveNote: async n => { await addDoc(collection(db,"notes"),{...n,ts:serverTimestamp()}); },
+  getNotes: async projId => { try{const s=await getDocs(query(collection(db,"notes"),orderBy("ts","desc"),limit(50)));return s.docs.map(d=>({id:d.id,...d.data()})).filter(n=>n.projectId===projId);}catch{return[];} },
+  logAct: async e => { try{await addDoc(collection(db,"activity"),{...e,ts:serverTimestamp()});}catch{} },
+};
 
-const getLocal = () => { try{return JSON.parse(localStorage.getItem("aldea_u")||"{}");}catch{return{};} };
-const saveLocal = u => { const d=getLocal(); d[u.id]=u; localStorage.setItem("aldea_u",JSON.stringify(d)); };
+// ── LOCAL AUTH ────────────────────────────────────────────────────────────────
+const getLocal = () => { try{return JSON.parse(localStorage.getItem("aldea_users")||"{}");}catch{return{};} };
+const saveLocal = u => { const d=getLocal(); d[u.id]=u; localStorage.setItem("aldea_users",JSON.stringify(d)); };
 const findLocal = (n,p) => Object.values(getLocal()).find(u=>u.name.toLowerCase()===n.toLowerCase()&&u.pass===p);
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
 const ROLES = {
-  director:  {label:"Director / Dueño",   color:"var(--accent)",icon:"◆",tabs:["briefs","email","proyectos","estrategia","campanas","equipo","historial"]},
-  creativo:  {label:"Director Creativo",  color:"var(--purple)",icon:"✦",tabs:["briefs","estrategia","campanas","email","historial"]},
-  cuentas:   {label:"Ejecutivo de Cuentas",color:"var(--blue)", icon:"◉",tabs:["briefs","email","proyectos","campanas","historial"]},
-  produccion:{label:"Producción / Social",color:"var(--pink)",  icon:"◈",tabs:["briefs","proyectos","campanas","historial"]},
+  director:  {label:"Director",    color:"var(--accent)", icon:"◆"},
+  creativo:  {label:"Creativo",    color:"var(--purple)", icon:"✦"},
+  cuentas:   {label:"Cuentas",     color:"var(--blue)",   icon:"◉"},
+  produccion:{label:"Producción",  color:"var(--pink)",   icon:"◈"},
 };
-const AREAS = {
-  "Diseño / Creatividad":{color:"var(--purple)",icon:"🎨"},
-  "Estrategia":          {color:"var(--amber)", icon:"💡"},
-  "Producción / Social": {color:"var(--pink)",  icon:"📱"},
-  "Cuentas / Comercial": {color:"var(--blue)",  icon:"💼"},
-  "Administración":      {color:"var(--green)", icon:"⚙️"},
+const AREAS = ["Diseño","Estrategia","Producción","Cuentas","Dirección"];
+const PROJECT_MODULES = ["Brief","Estrategia","Concepto","Medios","Tareas","Email","Archivos"];
+const MODULE_COLORS = {Brief:"var(--amber)",Estrategia:"var(--purple)",Concepto:"var(--pink)",Medios:"var(--blue)",Tareas:"var(--green)",Email:"var(--teal)",Archivos:"var(--muted2)"};
+
+// ── UI ATOMS ──────────────────────────────────────────────────────────────────
+const S = {
+  inp: {width:"100%",background:"var(--card2)",border:"1px solid var(--border2)",borderRadius:8,padding:"9px 13px",color:"var(--text)",fontSize:13.5},
+  btnP: (c="var(--accent)") => ({background:c,color:c==="var(--accent)"?"#08080a":"#fff",border:"none",borderRadius:8,padding:"9px 18px",fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:13,cursor:"pointer"}),
+  btnS: {background:"var(--card2)",color:"var(--text)",border:"1px solid var(--border2)",borderRadius:8,padding:"8px 13px",fontSize:12.5,cursor:"pointer"},
+  card: {background:"var(--card)",border:"1px solid var(--border)",borderRadius:12},
 };
-const ALL_TABS=[
-  {id:"briefs",     icon:"📁", label:"Briefs"},
-  {id:"email",      icon:"✉️", label:"Email"},
-  {id:"proyectos",  icon:"📋", label:"Proyectos"},
-  {id:"estrategia", icon:"💡", label:"Estrategia"},
-  {id:"campanas",   icon:"🎨", label:"Campañas"},
-  {id:"equipo",     icon:"👥", label:"Equipo"},
-  {id:"historial",  icon:"🗂", label:"Historial"},
-];
-const MC={email:"var(--blue)",proyectos:"var(--amber)",estrategia:"var(--purple)",campanas:"var(--pink)",briefs:"var(--green)",sistema:"var(--muted2)"};
-const ML={email:"Email",proyectos:"Proyectos",estrategia:"Estrategia",campanas:"Campañas",briefs:"Brief",sistema:"Sistema"};
+const Tag = ({color,children,small}) => <span style={{background:color+"20",color,border:`1px solid ${color}44`,borderRadius:4,padding:small?"1px 6px":"2px 8px",fontSize:small?10:11,fontWeight:600,whiteSpace:"nowrap"}}>{children}</span>;
+const Lbl = ({children}) => <label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:4,textTransform:"uppercase",letterSpacing:".08em"}}>{children}</label>;
+const Spin = ({size=14}) => <div style={{width:size,height:size,border:"2px solid var(--border2)",borderTop:"2px solid var(--accent)",borderRadius:"50%",animation:"spin .7s linear infinite",flexShrink:0}}/>;
+const Typing = () => <div style={{display:"flex",gap:4,padding:"8px 2px"}}>{[0,1,2].map(i=><div key={i} style={{width:5,height:5,borderRadius:"50%",background:"var(--accent)",animation:`blink 1.2s ${i*.2}s infinite`}}/>)}</div>;
+const Bubble = ({role:r,text}) => { const a=r==="assistant"; return <div className="fu" style={{display:"flex",justifyContent:a?"flex-start":"flex-end",marginBottom:8}}><div style={{maxWidth:"85%",background:a?"var(--card2)":"var(--accent)",color:a?"var(--text)":"#08080a",border:a?"1px solid var(--border2)":"none",borderRadius:a?"4px 12px 12px 12px":"12px 4px 12px 12px",padding:"9px 13px",fontSize:13,lineHeight:1.65,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{text}</div></div>; };
 
-const BASE=(r,n)=>`Sos el agente de Aldea Creative Hub, agencia 360 argentina. Hablás en español rioplatense con ${n} (${ROLES[r]?.label}). Sos estratégico, creativo y directo.`;
-const SYS_BRIEF_EXTRACT=`Sos un estratega de agencia 360. Dado un texto de brief, extraé la información clave y respondé SOLO con JSON sin markdown:
-{"cliente":"...","producto":"...","objetivo":"...","target":"...","presupuesto":"...","canales":"...","plazo":"...","competencia":"...","tono":"...","insight":"...","kpis":"...","resumen":"párrafo corto que resume todo el brief"}`;
-const SYS_EMAIL=(r,n,brief)=>`${BASE(r,n)}${brief?`\n\nCONTEXTO BRIEF ACTIVO — ${brief.cliente}:\n${brief.resumen||""}`:""}\nMÓDULO EMAIL. Respondé SIEMPRE:\n---CLASIFICACIÓN---\nTipo: [Cliente/Proveedor/Prospecto/Interno/Spam]\nUrgencia: [Alta/Media/Baja]\nResumen: [1 oración]\n---BORRADOR---\n[email completo]\n---ASUNTO SUGERIDO---\n[asunto]\n---ACCIÓN ASANA---\n[tarea o No aplica]`;
-const SYS_PROY=(r,n,team,brief)=>`${BASE(r,n)}${brief?`\n\nBRIEF ACTIVO — ${brief.cliente}:\nObjetivo: ${brief.objetivo||""}\nTarget: ${brief.target||""}\nPlazo: ${brief.plazo||""}\nCanales: ${brief.canales||""}`:""}\nEquipo:\n${team.map(m=>`- ${m.name} (${m.area||"Sin área"})`).join("\n")}\n\nRespondé SOLO con JSON sin markdown:\n{"resumen":"...","tareas":[{"nombre":"...","responsable":"nombre","prioridad":"alta|media|baja","deadline":"X días","notas":"..."}],"riesgos":"...","arranque":"..."}`;
-const SYS_EST=(r,n,brief)=>`${BASE(r,n)}${brief?`\n\nBRIEF ACTIVO — ${brief.cliente}:\n${JSON.stringify({objetivo:brief.objetivo,target:brief.target,tono:brief.tono,insight:brief.insight,competencia:brief.competencia})}`:""}\nMÓDULO ESTRATEGIA: insight central + 3 territorios creativos distintos (nombre+concepto+ejemplo) + pregunta estratégica clave.`;
-const SYS_CAMP=(r,n,brief)=>`${BASE(r,n)}${brief?`\n\nBRIEF ACTIVO — ${brief.cliente}:\nProducto: ${brief.producto||""}\nObjetivo: ${brief.objetivo||""}\nTarget: ${brief.target||""}\nPresupuesto: ${brief.presupuesto||""}\nCanales: ${brief.canales||""}\nTono: ${brief.tono||""}`:""}\nCAMPAÑAS 360:\n**CONCEPTO**: nombre/idea/tagline\n**PIEZAS** (4 formatos): formato·copy principal·copy secundario·dir de arte\n**PLAN DE MEDIOS**: canales+%\n**KPIs**: 3 métricas`;
-
-const inp={width:"100%",background:"var(--card)",border:"1px solid var(--border2)",borderRadius:8,padding:"10px 14px",color:"var(--text)",fontSize:14,outline:"none"};
-const btnP=(c="var(--accent)")=>({background:c,color:c==="var(--accent)"?"#09090b":"#fff",border:"none",borderRadius:8,padding:"10px 20px",fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:13.5,cursor:"pointer"});
-const btnS={background:"var(--card)",color:"var(--text)",border:"1px solid var(--border2)",borderRadius:8,padding:"9px 14px",fontSize:13,cursor:"pointer"};
-
-function Tag({color,children}){return <span style={{background:color+"20",color,border:`1px solid ${color}44`,borderRadius:4,padding:"2px 8px",fontSize:11,fontWeight:600}}>{children}</span>;}
-function Typing(){return <div style={{display:"flex",gap:5,padding:"10px 4px"}}>{[0,1,2].map(i=><div key={i} style={{width:6,height:6,borderRadius:"50%",background:"var(--accent)",animation:`blink 1.2s ${i*.2}s infinite`}}/>)}</div>;}
-function Spin(){return <div style={{width:16,height:16,border:"2px solid var(--border2)",borderTop:"2px solid var(--accent)",borderRadius:"50%",animation:"spin .7s linear infinite"}}/>;}
-function Bubble({role:r,text}){const a=r==="assistant";return <div className="fu" style={{display:"flex",justifyContent:a?"flex-start":"flex-end",marginBottom:10}}><div style={{maxWidth:"82%",background:a?"var(--card)":"var(--accent)",color:a?"var(--text)":"#09090b",border:a?"1px solid var(--border)":"none",borderRadius:a?"4px 14px 14px 14px":"14px 4px 14px 14px",padding:"11px 15px",fontSize:13.5,lineHeight:1.68,whiteSpace:"pre-wrap",wordBreak:"break-word"}}>{text}</div></div>;}
-function MH({icon,title,sub,right}){return <div style={{marginBottom:16,paddingBottom:14,borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}><div><div style={{fontFamily:"'Syne',sans-serif",fontSize:18,fontWeight:800,marginBottom:3}}>{icon} {title}</div><div style={{fontSize:12.5,color:"var(--muted2)"}}>{sub}</div></div>{right}</div>;}
-
-// ── BRIEF SELECTOR BAR ────────────────────────────────────────────────────────
-function BriefBar({briefs, activeBrief, onSelect}){
-  if(!briefs.length) return null;
-  return(
-    <div style={{background:"#b8ff5708",border:"1px solid #b8ff5720",borderRadius:8,padding:"8px 14px",marginBottom:14,display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-      <span style={{fontSize:11,color:"var(--accent)",fontWeight:700,textTransform:"uppercase",letterSpacing:".08em",flexShrink:0}}>Brief activo</span>
-      <select value={activeBrief?.id||""} onChange={e=>onSelect(briefs.find(b=>b.id===e.target.value)||null)}
-        style={{...inp,width:"auto",fontSize:12,padding:"4px 10px",appearance:"none",flex:1,minWidth:180}}>
-        <option value="">— Sin brief seleccionado —</option>
-        {briefs.map(b=><option key={b.id} value={b.id}>{b.cliente} — {b.producto||"sin producto"}</option>)}
-      </select>
-      {activeBrief&&<span style={{fontSize:11,color:"var(--muted2)",maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{activeBrief.resumen}</span>}
-    </div>
-  );
+function Avatar({name,color,size=32}){
+  return <div style={{width:size,height:size,borderRadius:"50%",background:(color||"var(--muted)")+"22",border:`1.5px solid ${color||"var(--muted)"}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:size*0.38,fontWeight:700,color:color||"var(--muted2)",flexShrink:0}}>{name?name[0].toUpperCase():"?"}</div>;
 }
 
-// ── SETUP ─────────────────────────────────────────────────────────────────────
-function Setup({onEnter}){
-  const [mode,setMode]=useState("login");
-  const [f,setF]=useState({name:"",role:"director",area:"Diseño / Creatividad",apiKey:"",pass:"",uid:"",lp:""});
-  const [err,setErr]=useState(""); const [loading,setLoading]=useState(false);
-  const up=(k,v)=>setF(p=>({...p,[k]:v}));
-  const register=async()=>{
+// ── LOGIN / REGISTER ──────────────────────────────────────────────────────────
+function Auth({onEnter}) {
+  const [mode,setMode] = useState("login");
+  const [f,setF] = useState({name:"",role:"director",area:"Dirección",apiKey:"",pass:"",uid:"",lp:""});
+  const [err,setErr] = useState(""); const [loading,setLoading] = useState(false);
+  const up = (k,v) => setF(p=>({...p,[k]:v}));
+
+  const register = async () => {
     if(!f.name.trim()){setErr("Ingresá tu nombre");return;}
-    if(!f.apiKey.trim().startsWith("sk-ant-")){setErr("API key inválida");return;}
+    if(!f.apiKey.trim().startsWith("sk-ant-")){setErr("API key inválida (debe empezar con sk-ant-)");return;}
     if(!f.pass.trim()){setErr("Ingresá una contraseña");return;}
     setLoading(true);setErr("");
-    try{
-      await callClaude(f.apiKey.trim(),"Respondé solo: OK","OK");
-      const id=f.name.trim().toLowerCase().replace(/\s+/g,"-")+"-"+Date.now().toString(36);
-      const user={id,name:f.name.trim(),role:f.role,area:f.area,apiKey:f.apiKey.trim(),pass:f.pass.trim(),createdAt:Date.now()};
-      await saveUser(user);saveLocal(user);
-      await logAct({userId:id,userName:user.name,userRole:user.role,module:"sistema",action:"Se registró en Aldea"});
+    try {
+      await claude(f.apiKey.trim(),"Respondé solo: OK","OK");
+      const id = f.name.trim().toLowerCase().replace(/\s+/g,"-")+"-"+Date.now().toString(36);
+      const user = {id,name:f.name.trim(),role:f.role,area:f.area,apiKey:f.apiKey.trim(),pass:f.pass.trim(),createdAt:Date.now()};
+      await fb.saveUser(user); saveLocal(user);
+      await fb.logAct({userId:id,userName:user.name,module:"sistema",action:"Registrado"});
       onEnter(user);
-    }catch(e){setErr("Error: "+e.message);}
+    } catch(e) { setErr("Error: "+e.message); }
     setLoading(false);
   };
-  const login=async()=>{
-    if(!f.uid.trim()||!f.lp.trim()){setErr("Completá todos los campos");return;}
+
+  const login = async () => {
+    if(!f.uid.trim()||!f.lp.trim()){setErr("Completá los campos");return;}
     setLoading(true);setErr("");
-    const found=findLocal(f.uid.trim(),f.lp.trim());
+    const found = findLocal(f.uid.trim(),f.lp.trim());
     if(!found){setErr("Usuario o contraseña incorrectos");setLoading(false);return;}
-    await logAct({userId:found.id,userName:found.name,userRole:found.role,module:"sistema",action:"Inició sesión"});
-    setLoading(false);onEnter(found);
+    await fb.logAct({userId:found.id,userName:found.name,module:"sistema",action:"Login"});
+    setLoading(false); onEnter(found);
   };
-  return(
-    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"var(--bg)",padding:24}}>
-      <div className="fu" style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:18,padding:48,maxWidth:440,width:"100%"}}>
-        <div style={{marginBottom:32,textAlign:"center"}}>
-          <div style={{fontFamily:"'Syne',sans-serif",fontSize:26,fontWeight:800,letterSpacing:"-.03em",marginBottom:6}}><span style={{color:"var(--accent)"}}>Aldea</span> <span style={{color:"var(--muted2)",fontWeight:400}}>Creative</span> Hub</div>
-          <div style={{fontSize:11,color:"var(--muted)",letterSpacing:".12em",textTransform:"uppercase"}}>Agente cerebro · agencia 360</div>
+
+  return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"var(--bg)",padding:20}}>
+      <div className="fu" style={{...S.card,padding:44,maxWidth:420,width:"100%"}}>
+        <div style={{textAlign:"center",marginBottom:28}}>
+          <div style={{fontFamily:"'Syne',sans-serif",fontSize:24,fontWeight:800,letterSpacing:"-.03em",marginBottom:5}}>
+            <span style={{color:"var(--accent)"}}>Aldea</span> <span style={{color:"var(--muted2)",fontWeight:400}}>Creative</span> Hub
+          </div>
+          <div style={{fontSize:11,color:"var(--muted)",letterSpacing:".1em",textTransform:"uppercase"}}>Sistema operativo de tu agencia</div>
         </div>
-        <div style={{display:"flex",background:"var(--card)",borderRadius:8,padding:3,marginBottom:22,border:"1px solid var(--border)"}}>
-          {["login","register"].map(m=><button key={m} onClick={()=>{setMode(m);setErr("");}} style={{flex:1,padding:"8px 0",border:"none",borderRadius:6,fontSize:13,fontWeight:500,background:mode===m?"var(--border2)":"transparent",color:mode===m?"var(--text)":"var(--muted)"}}>{m==="login"?"Ingresar":"Registrarse"}</button>)}
+
+        <div style={{display:"flex",background:"var(--card2)",borderRadius:8,padding:3,marginBottom:20,border:"1px solid var(--border)"}}>
+          {["login","register"].map(m=><button key={m} onClick={()=>{setMode(m);setErr("");}} style={{flex:1,padding:"7px 0",border:"none",borderRadius:6,fontSize:12.5,fontWeight:500,background:mode===m?"var(--border2)":"transparent",color:mode===m?"var(--text)":"var(--muted)"}}>{m==="login"?"Ingresar":"Registrarse"}</button>)}
         </div>
-        <div style={{display:"flex",flexDirection:"column",gap:13}}>
-          {mode==="register"?(<>
-            <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Tu nombre</label><input value={f.name} onChange={e=>up("name",e.target.value)} placeholder="Ej: Mathias Gamarra" style={inp}/></div>
-            <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Tu rol</label><select value={f.role} onChange={e=>up("role",e.target.value)} style={{...inp,appearance:"none"}}>{Object.entries(ROLES).map(([k,v])=><option key={k} value={k}>{v.icon} {v.label}</option>)}</select></div>
-            <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Tu área</label><select value={f.area} onChange={e=>up("area",e.target.value)} style={{...inp,appearance:"none"}}>{Object.keys(AREAS).map(a=><option key={a} value={a}>{AREAS[a].icon} {a}</option>)}</select></div>
-            <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Anthropic API Key</label><input type="password" value={f.apiKey} onChange={e=>up("apiKey",e.target.value)} placeholder="sk-ant-api03-..." style={inp}/></div>
-            <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Contraseña</label><input type="password" value={f.pass} onChange={e=>up("pass",e.target.value)} placeholder="Elegí una contraseña" style={inp} onKeyDown={e=>e.key==="Enter"&&register()}/></div>
-          </>):(<>
-            <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Nombre de usuario</label><input value={f.uid} onChange={e=>up("uid",e.target.value)} placeholder="Tu nombre" style={inp}/></div>
-            <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Contraseña</label><input type="password" value={f.lp} onChange={e=>up("lp",e.target.value)} placeholder="Tu contraseña" style={inp} onKeyDown={e=>e.key==="Enter"&&login()}/></div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:11}}>
+          {mode==="register" ? (<>
+            <div><Lbl>Nombre</Lbl><input value={f.name} onChange={e=>up("name",e.target.value)} placeholder="Tu nombre completo" style={S.inp}/></div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+              <div><Lbl>Rol</Lbl><select value={f.role} onChange={e=>up("role",e.target.value)} style={{...S.inp,appearance:"none"}}>{Object.entries(ROLES).map(([k,v])=><option key={k} value={k}>{v.icon} {v.label}</option>)}</select></div>
+              <div><Lbl>Área</Lbl><select value={f.area} onChange={e=>up("area",e.target.value)} style={{...S.inp,appearance:"none"}}>{AREAS.map(a=><option key={a} value={a}>{a}</option>)}</select></div>
+            </div>
+            <div><Lbl>Anthropic API Key</Lbl><input type="password" value={f.apiKey} onChange={e=>up("apiKey",e.target.value)} placeholder="sk-ant-api03-..." style={S.inp}/><div style={{fontSize:10.5,color:"var(--muted)",marginTop:3}}>console.anthropic.com → API Keys</div></div>
+            <div><Lbl>Contraseña</Lbl><input type="password" value={f.pass} onChange={e=>up("pass",e.target.value)} placeholder="Elegí una contraseña" style={S.inp} onKeyDown={e=>e.key==="Enter"&&register()}/></div>
+          </>) : (<>
+            <div><Lbl>Usuario</Lbl><input value={f.uid} onChange={e=>up("uid",e.target.value)} placeholder="Tu nombre" style={S.inp}/></div>
+            <div><Lbl>Contraseña</Lbl><input type="password" value={f.lp} onChange={e=>up("lp",e.target.value)} placeholder="Tu contraseña" style={S.inp} onKeyDown={e=>e.key==="Enter"&&login()}/></div>
           </>)}
-          {err&&<div style={{background:"#ff5f5f12",border:"1px solid #ff5f5f30",borderRadius:8,padding:"9px 13px",fontSize:13,color:"var(--red)"}}>{err}</div>}
-          <button onClick={mode==="register"?register:login} disabled={loading} style={{...btnP(),width:"100%",marginTop:4,opacity:loading?.6:1,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+          {err && <div style={{background:"#ff5f5f12",border:"1px solid #ff5f5f30",borderRadius:7,padding:"8px 12px",fontSize:12.5,color:"var(--red)"}}>{err}</div>}
+          <button onClick={mode==="register"?register:login} disabled={loading} style={{...S.btnP(),width:"100%",marginTop:4,display:"flex",alignItems:"center",justifyContent:"center",gap:7,opacity:loading?.6:1}}>
             {loading?<><Spin/>Verificando...</>:mode==="register"?"Crear cuenta →":"Entrar →"}
           </button>
         </div>
@@ -174,483 +168,624 @@ function Setup({onEnter}){
   );
 }
 
-// ── BRIEFS MODULE ─────────────────────────────────────────────────────────────
-function BriefsModule({user, briefs, onBriefsUpdate, onActivate}){
-  const [view,setView]=useState("lista"); // lista | nuevo | detalle
-  const [selected,setSelected]=useState(null);
-  const [form,setForm]=useState({cliente:"",producto:"",texto:""});
-  const [file,setFile]=useState(null);
-  const [loading,setLoading]=useState(false);
-  const [msg,setMsg]=useState("");
-  const fileRef=useRef();
-
-  const readFile=f=>new Promise((res,rej)=>{
-    const r=new FileReader();
-    r.onload=e=>res(e.target.result);
-    r.onerror=rej;
-    if(f.name.endsWith(".pdf")||f.type==="application/pdf") r.readAsDataURL(f);
-    else r.readAsText(f);
-  });
-
-  const extractBrief=async()=>{
-    if(!form.texto.trim()&&!file){setMsg("❌ Escribí el brief o subí un archivo");return;}
-    setLoading(true);setMsg("");
-    try{
-      let textContent=form.texto.trim();
-      if(file&&!textContent){
-        if(file.name.endsWith(".pdf")||file.type==="application/pdf"){
-          textContent=`[Archivo PDF: ${file.name}] El usuario subió un brief en PDF. Extraé la info con lo que puedas inferir del nombre: ${file.name}`;
-        } else {
-          textContent=await readFile(file);
-        }
-      }
-      const prompt=`Brief a analizar:\nCliente: ${form.cliente||"No especificado"}\nProducto: ${form.producto||"No especificado"}\n\nContenido:\n${textContent}`;
-      const r=await callClaude(user.apiKey,SYS_BRIEF_EXTRACT,prompt);
-      const clean=r.replace(/```json|```/g,"").trim();
-      const parsed=JSON.parse(clean);
-      const id="brief-"+Date.now().toString(36);
-      const brief={id,...parsed,cliente:form.cliente||parsed.cliente||"Sin nombre",rawText:textContent.slice(0,3000),createdBy:user.name,createdAt:Date.now()};
-      await saveBrief(brief);
-      onBriefsUpdate([brief,...briefs]);
-      setMsg(`✓ Brief de ${brief.cliente} guardado`);
-      setSelected(brief);setView("detalle");
-      setForm({cliente:"",producto:"",texto:""});setFile(null);
-      await logAct({userId:user.id,userName:user.name,userRole:user.role,module:"briefs",action:`Brief creado: ${brief.cliente}`});
-    }catch(e){setMsg("❌ Error: "+e.message);}
-    setLoading(false);
-  };
-
-  if(view==="detalle"&&selected) return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}} className="fu">
-      <MH icon="📁" title={selected.cliente} sub={selected.producto||""}
-        right={<div style={{display:"flex",gap:7}}>
-          <button onClick={()=>onActivate(selected)} style={{...btnP(),padding:"7px 14px",fontSize:12}}>⚡ Activar en todos</button>
-          <button onClick={()=>setView("lista")} style={{...btnS,fontSize:12,padding:"5px 11px"}}>← Volver</button>
-        </div>}
-      />
-      <div style={{flex:1,overflowY:"auto",maxHeight:460}}>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:16}}>
-          {[["🎯 Objetivo",selected.objetivo],["👥 Target",selected.target],["💰 Presupuesto",selected.presupuesto],["📡 Canales",selected.canales],["⏱ Plazo",selected.plazo],["🏆 Competencia",selected.competencia],["🗣 Tono",selected.tono],["📊 KPIs",selected.kpis]].map(([k,v])=>v&&(
-            <div key={k} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:8,padding:"10px 12px"}}>
-              <div style={{fontSize:11,color:"var(--muted)",marginBottom:4}}>{k}</div>
-              <div style={{fontSize:13,color:"var(--text)"}}>{v}</div>
-            </div>
-          ))}
-        </div>
-        {selected.insight&&<div style={{background:"#b8ff5710",border:"1px solid #b8ff5730",borderRadius:10,padding:"12px 14px",marginBottom:12}}>
-          <div style={{fontSize:11,color:"var(--accent)",fontWeight:700,marginBottom:4,textTransform:"uppercase",letterSpacing:".08em"}}>💡 Insight</div>
-          <div style={{fontSize:13.5,color:"var(--text)",lineHeight:1.65}}>{selected.insight}</div>
-        </div>}
-        {selected.resumen&&<div style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:10,padding:"12px 14px"}}>
-          <div style={{fontSize:11,color:"var(--muted)",marginBottom:4,textTransform:"uppercase",letterSpacing:".08em"}}>Resumen</div>
-          <div style={{fontSize:13,color:"var(--muted2)",lineHeight:1.65}}>{selected.resumen}</div>
-        </div>}
-      </div>
-    </div>
-  );
-
-  if(view==="nuevo") return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}} className="fu">
-      <MH icon="📁" title="Nuevo Brief" sub="Subí un archivo o escribí el brief directo"
-        right={<button onClick={()=>setView("lista")} style={{...btnS,fontSize:12,padding:"5px 11px"}}>← Volver</button>}
-      />
-      <div style={{display:"flex",flexDirection:"column",gap:12,flex:1,overflowY:"auto"}}>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-          <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Nombre del cliente</label><input value={form.cliente} onChange={e=>setForm(p=>({...p,cliente:e.target.value}))} placeholder="Ej: Café Oculto" style={inp}/></div>
-          <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Producto / campaña</label><input value={form.producto} onChange={e=>setForm(p=>({...p,producto:e.target.value}))} placeholder="Ej: Lanzamiento verano" style={inp}/></div>
-        </div>
-
-        <div style={{border:"2px dashed var(--border2)",borderRadius:10,padding:20,textAlign:"center",cursor:"pointer",transition:"border .2s"}}
-          onClick={()=>fileRef.current?.click()}
-          onDragOver={e=>{e.preventDefault();e.currentTarget.style.borderColor="var(--accent)";}}
-          onDragLeave={e=>{e.currentTarget.style.borderColor="var(--border2)";}}
-          onDrop={e=>{e.preventDefault();e.currentTarget.style.borderColor="var(--border2)";const f=e.dataTransfer.files[0];if(f)setFile(f);}}>
-          <input ref={fileRef} type="file" accept=".pdf,.doc,.docx,.txt" style={{display:"none"}} onChange={e=>setFile(e.target.files[0])}/>
-          {file?<div style={{color:"var(--accent)",fontSize:14}}>📎 {file.name}</div>:<div><div style={{fontSize:24,marginBottom:8}}>📎</div><div style={{fontSize:13,color:"var(--muted)"}}>Arrastrá o clic para subir PDF, Word o TXT</div></div>}
-        </div>
-
-        <div><label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>O escribí el brief acá</label>
-          <textarea value={form.texto} onChange={e=>setForm(p=>({...p,texto:e.target.value}))} placeholder="Pegá o escribí el contenido del brief..." rows={8} style={inp}/>
-        </div>
-
-        {msg&&<div style={{fontSize:13,color:msg.startsWith("✓")?"var(--green)":"var(--red)",padding:"8px 0"}}>{msg}</div>}
-
-        <button onClick={extractBrief} disabled={loading} style={{...btnP(),width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:8,opacity:loading?.6:1}}>
-          {loading?<><Spin/>Analizando brief...</>:"✦ Analizar y guardar brief"}
-        </button>
-      </div>
-    </div>
-  );
-
-  return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}}>
-      <MH icon="📁" title="Briefs" sub="Central de briefs por cliente — activan el contexto en todos los módulos"
-        right={<button onClick={()=>setView("nuevo")} style={{...btnP(),padding:"8px 16px",fontSize:13}}>+ Nuevo brief</button>}
-      />
-      {briefs.length===0?(
-        <div style={{textAlign:"center",padding:"60px 20px",color:"var(--muted)"}}>
-          <div style={{fontSize:36,marginBottom:12}}>📁</div>
-          <div style={{fontSize:14,marginBottom:16}}>No hay briefs todavía</div>
-          <button onClick={()=>setView("nuevo")} style={{...btnP(),padding:"10px 20px",fontSize:13}}>+ Crear el primer brief</button>
-        </div>
-      ):(
-        <div style={{flex:1,overflowY:"auto",maxHeight:480}}>
-          {briefs.map(b=>(
-            <div key={b.id} onClick={()=>{setSelected(b);setView("detalle");}}
-              style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:10,padding:"13px 15px",marginBottom:7,cursor:"pointer",transition:"border .2s"}}
-              onMouseEnter={e=>e.currentTarget.style.borderColor="var(--accent)"}
-              onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
-                <div style={{flex:1}}>
-                  <div style={{fontFamily:"'Syne',sans-serif",fontSize:15,fontWeight:700,marginBottom:4}}>{b.cliente}</div>
-                  <div style={{fontSize:12.5,color:"var(--muted2)",marginBottom:6}}>{b.producto||"Sin producto definido"}</div>
-                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                    {b.objetivo&&<Tag color="var(--blue)">{b.objetivo.slice(0,40)}</Tag>}
-                    {b.canales&&<Tag color="var(--purple)">{b.canales.slice(0,30)}</Tag>}
-                  </div>
-                </div>
-                <div style={{textAlign:"right",flexShrink:0}}>
-                  <div style={{fontSize:11,color:"var(--muted)"}}>{b.createdBy}</div>
-                  <button onClick={e=>{e.stopPropagation();onActivate(b);}} style={{...btnP(),padding:"5px 10px",fontSize:11,marginTop:6}}>⚡ Activar</button>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── EMAIL ─────────────────────────────────────────────────────────────────────
-function EmailModule({user,briefs,activeBrief,onSelectBrief}){
-  const [input,setInput]=useState(""); const [msgs,setMsgs]=useState([]); const [loading,setLoading]=useState(false);
-  const [draft,setDraft]=useState(null); const [approved,setApproved]=useState(false); const [copied,setCopied]=useState(false);
-  const bottom=useRef();
+// ── GLOBAL AGENT CHAT ─────────────────────────────────────────────────────────
+function AgentChat({user, context, onClose}) {
+  const [msgs, setMsgs] = useState([{role:"assistant",text:`Hola ${user.name}! Soy tu agente. ${context?`Estoy viendo el contexto de "${context}". `:""} ¿En qué te ayudo?`}]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const bottom = useRef();
   useEffect(()=>{bottom.current?.scrollIntoView({behavior:"smooth"});},[msgs,loading]);
-  const send=async()=>{
-    const msg=input.trim(); if(!msg||loading) return;
-    setInput(""); setDraft(null); setApproved(false); setCopied(false);
+
+  const SYS = `Sos el agente de Aldea Creative Hub, agencia 360 argentina. Hablás en español rioplatense con ${user.name} (${ROLES[user.role]?.label}). Sos estratégico, creativo y directo. ${context?`Contexto actual: ${context}`:""} Ayudás con estrategia, campañas, análisis de mails, organización de proyectos y búsqueda de nuevos clientes.`;
+
+  const send = async () => {
+    const msg = input.trim(); if(!msg||loading) return;
+    setInput("");
     setMsgs(p=>[...p,{role:"user",text:msg}]); setLoading(true);
-    try{
-      const r=await callClaude(user.apiKey,SYS_EMAIL(user.role,user.name,activeBrief),msg,msgs.map(m=>({role:m.role,content:m.text})));
+    try {
+      const r = await claude(user.apiKey, SYS, msg, msgs.slice(-6).map(m=>({role:m.role,content:m.text})));
       setMsgs(p=>[...p,{role:"assistant",text:r}]);
-      await logAct({userId:user.id,userName:user.name,userRole:user.role,module:"email",action:msg.slice(0,60)});
-      const bm=r.match(/---BORRADOR---([\s\S]*?)---ASUNTO SUGERIDO---/);
-      const sm=r.match(/---ASUNTO SUGERIDO---([\s\S]*?)---ACCIÓN ASANA---/);
-      if(bm) setDraft({body:bm[1].trim(),subject:sm?sm[1].trim():""});
-    }catch(e){setMsgs(p=>[...p,{role:"assistant",text:"❌ "+e.message}]);}
+    } catch(e) { setMsgs(p=>[...p,{role:"assistant",text:"❌ "+e.message}]); }
     setLoading(false);
   };
-  return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}}>
-      <MH icon="✉️" title="Email inteligente" sub="Pegá un email → clasifica, resume y redacta la respuesta para tu aprobación"/>
-      <BriefBar briefs={briefs} activeBrief={activeBrief} onSelect={onSelectBrief}/>
-      <div style={{flex:1,overflowY:"auto",minHeight:200,maxHeight:320,paddingBottom:8}}>
-        {msgs.length===0&&<div style={{textAlign:"center",padding:"40px 20px",color:"var(--muted)"}}><div style={{fontSize:28,marginBottom:8}}>✉️</div><div style={{fontSize:13}}>Pegá el email que recibiste</div></div>}
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div style={{padding:"12px 14px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:"var(--accent)",animation:"pulse 2s infinite"}}/>
+          <span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:13}}>Agente Aldea</span>
+        </div>
+        {onClose&&<button onClick={onClose} style={{background:"none",border:"none",color:"var(--muted)",fontSize:16,padding:"0 4px"}}>×</button>}
+      </div>
+      <div style={{flex:1,overflowY:"auto",padding:"12px 14px"}}>
         {msgs.map((m,i)=><Bubble key={i} {...m}/>)}
-        {loading&&<Typing/>}<div ref={bottom}/>
+        {loading&&<Typing/>}
+        <div ref={bottom}/>
       </div>
-      {draft&&!approved&&<div className="fu" style={{background:"#b8ff5712",border:"1px solid #b8ff5730",borderRadius:10,padding:12,margin:"8px 0"}}>
-        <div style={{fontSize:11,color:"var(--accent)",fontWeight:700,marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>¿Aprobás el borrador?</div>
-        <div style={{fontSize:12.5,color:"var(--muted2)",marginBottom:8}}>Asunto: <strong style={{color:"var(--text)"}}>{draft.subject}</strong></div>
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={()=>{try{navigator.clipboard.writeText(`Asunto: ${draft.subject}\n\n${draft.body}`);}catch(e){}setCopied(true);setApproved(true);setTimeout(()=>setCopied(false),2500);}} style={{...btnP(),padding:"7px 14px",fontSize:13}}>✓ Aprobar y copiar</button>
-          <button onClick={()=>{setDraft(null);setInput("Reescribí con tono más formal");}} style={{...btnS,fontSize:13}}>↺ Reescribir</button>
-        </div>
-      </div>}
-      {approved&&<div className="fu" style={{background:"#4dffc310",border:"1px solid #4dffc330",borderRadius:8,padding:"8px 12px",margin:"8px 0",fontSize:13,color:"var(--green)"}}>{copied?"✓ Copiado — pegalo en Gmail":"✓ Borrador aprobado"}</div>}
-      <div style={{display:"flex",gap:8,paddingTop:11,borderTop:"1px solid var(--border)",alignItems:"flex-end"}}>
-        <textarea value={input} onChange={e=>setInput(e.target.value)} placeholder="Pegá el email que recibiste..." rows={3} style={{...inp,flex:1}} onKeyDown={e=>{if(e.key==="Enter"&&e.metaKey)send();}}/>
-        <button onClick={send} disabled={loading||!input.trim()} style={{...btnP(),padding:"11px 18px",opacity:(!input.trim()||loading)?.35:1}}>{loading?"...":"→"}</button>
+      <div style={{padding:"10px 12px",borderTop:"1px solid var(--border)",display:"flex",gap:7,flexShrink:0}}>
+        <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Preguntale al agente..." style={{...S.inp,flex:1,fontSize:12.5,padding:"8px 11px"}} onKeyDown={e=>e.key==="Enter"&&send()}/>
+        <button onClick={send} disabled={loading||!input.trim()} style={{...S.btnP(),padding:"8px 14px",opacity:(!input.trim()||loading)?.35:1}}>→</button>
       </div>
     </div>
   );
 }
 
-// ── PROYECTOS ─────────────────────────────────────────────────────────────────
-function ProyectosModule({user,briefs,activeBrief,onSelectBrief}){
-  const [input,setInput]=useState(""); const [msgs,setMsgs]=useState([]); const [loading,setLoading]=useState(false);
-  const [parsed,setParsed]=useState(null); const [view,setView]=useState("chat");
-  const [ws,setWs]=useState([]); const [selWs,setSelWs]=useState("");
-  const [projects,setProjects]=useState([]); const [selProject,setSelProject]=useState("");
-  const [tasks,setTasks]=useState([]); const [members,setMembers]=useState([]);
-  const [creating,setCreating]=useState(false); const [createMsg,setCreateMsg]=useState("");
-  const [asanaLoad,setAsanaLoad]=useState(false); const [dbUsers,setDbUsers]=useState([]);
-  const bottom=useRef();
+// ── CLIENT CARD ───────────────────────────────────────────────────────────────
+function ClientCard({client, onClick, projectCount=0}) {
+  const colors = ["var(--accent)","var(--purple)","var(--blue)","var(--pink)","var(--amber)","var(--teal)"];
+  const color = colors[client.name.charCodeAt(0) % colors.length];
+  return (
+    <div onClick={onClick} className="fu" style={{...S.card,padding:0,cursor:"pointer",overflow:"hidden",transition:"border .2s"}}
+      onMouseEnter={e=>e.currentTarget.style.borderColor="var(--border3)"}
+      onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}>
+      <div style={{height:5,background:color}}/>
+      <div style={{padding:"16px 18px"}}>
+        <div style={{display:"flex",alignItems:"flex-start",gap:12,marginBottom:10}}>
+          {client.coverColor ? (
+            <div style={{width:44,height:44,borderRadius:10,background:client.coverColor,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff",fontFamily:"'Syne',sans-serif"}}>{client.name[0].toUpperCase()}</div>
+          ) : (
+            <div style={{width:44,height:44,borderRadius:10,background:color+"22",border:`1px solid ${color}44`,flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:700,color}}>{client.name[0].toUpperCase()}</div>
+          )}
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:15,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{client.name}</div>
+            <div style={{fontSize:12,color:"var(--muted2)"}}>{client.industry||"Sin industria"}</div>
+          </div>
+        </div>
+        <div style={{fontSize:11.5,color:"var(--muted2)",marginBottom:10,lineHeight:1.5,height:32,overflow:"hidden",textOverflow:"ellipsis",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>{client.description||"Sin descripción"}</div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <span style={{fontSize:11,color:"var(--muted)"}}>📋 {projectCount} proyecto{projectCount!==1?"s":""}</span>
+          {client.status&&<Tag color={client.status==="activo"?"var(--green)":client.status==="prospecto"?"var(--amber)":"var(--muted2)"} small>{client.status}</Tag>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── NEW CLIENT MODAL ──────────────────────────────────────────────────────────
+function NewClientModal({onSave, onClose}) {
+  const [f, setF] = useState({name:"",industry:"",description:"",contact:"",email:"",status:"activo",coverColor:""});
+  const up = (k,v) => setF(p=>({...p,[k]:v}));
+  const COLORS = ["#7c3aed","#2563eb","#dc2626","#059669","#d97706","#db2777","#0891b2"];
+  const save = () => {
+    if(!f.name.trim()) return;
+    const id = "client-"+Date.now().toString(36);
+    onSave({id,...f,createdAt:Date.now()});
+  };
+  return (
+    <div style={{position:"fixed",inset:0,background:"#000000cc",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:20}}>
+      <div className="fu" style={{...S.card,padding:32,maxWidth:480,width:"100%",maxHeight:"90vh",overflowY:"auto"}}>
+        <div style={{fontFamily:"'Syne',sans-serif",fontSize:17,fontWeight:800,marginBottom:20}}>+ Nuevo cliente</div>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div><Lbl>Nombre del cliente *</Lbl><input value={f.name} onChange={e=>up("name",e.target.value)} placeholder="Ej: Café Oculto" style={S.inp} autoFocus/></div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div><Lbl>Industria</Lbl><input value={f.industry} onChange={e=>up("industry",e.target.value)} placeholder="Gastronomía" style={S.inp}/></div>
+            <div><Lbl>Estado</Lbl><select value={f.status} onChange={e=>up("status",e.target.value)} style={{...S.inp,appearance:"none"}}><option value="activo">Activo</option><option value="prospecto">Prospecto</option><option value="pausado">Pausado</option></select></div>
+          </div>
+          <div><Lbl>Descripción</Lbl><textarea value={f.description} onChange={e=>up("description",e.target.value)} placeholder="Qué hace, cuál es su propuesta de valor..." rows={3} style={S.inp}/></div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+            <div><Lbl>Contacto</Lbl><input value={f.contact} onChange={e=>up("contact",e.target.value)} placeholder="Nombre del contacto" style={S.inp}/></div>
+            <div><Lbl>Email</Lbl><input value={f.email} onChange={e=>up("email",e.target.value)} placeholder="email@cliente.com" style={S.inp}/></div>
+          </div>
+          <div>
+            <Lbl>Color de portada</Lbl>
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              {COLORS.map(c=><div key={c} onClick={()=>up("coverColor",c)} style={{width:28,height:28,borderRadius:"50%",background:c,cursor:"pointer",border:f.coverColor===c?"3px solid var(--text)":"3px solid transparent",transition:"border .15s"}}/>)}
+              <div onClick={()=>up("coverColor","")} style={{width:28,height:28,borderRadius:"50%",background:"var(--border2)",cursor:"pointer",border:!f.coverColor?"3px solid var(--text)":"3px solid transparent",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:"var(--muted)"}}>Auto</div>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,marginTop:4}}>
+            <button onClick={save} disabled={!f.name.trim()} style={{...S.btnP(),flex:1,opacity:!f.name.trim()?.5:1}}>Crear cliente →</button>
+            <button onClick={onClose} style={S.btnS}>Cancelar</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── PROJECT MODULE PANEL ──────────────────────────────────────────────────────
+function ModulePanel({mod, project, client, user, asanaData, onClose}) {
+  const [msgs, setMsgs] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [tasks, setTasks] = useState([]);
+  const [creating, setCreating] = useState(false);
+  const [createMsg, setCreateMsg] = useState("");
+  const [parsed, setParsed] = useState(null);
+  const [content, setContent] = useState(project?.modules?.[mod] || "");
+  const [saved, setSaved] = useState(false);
+  const bottom = useRef();
   useEffect(()=>{bottom.current?.scrollIntoView({behavior:"smooth"});},[msgs,loading]);
+
+  // Load Asana tasks for this project
   useEffect(()=>{
-    (async()=>{
-      try{const w=await getWS();setWs(w||[]);if(w&&w.length){setSelWs(w[0].gid);const [p,m]=await Promise.all([getProjs(w[0].gid),getMembers(w[0].gid)]);setProjects(p||[]);setMembers(m||[]);}}catch(e){}
-      getAllUsers().then(u=>setDbUsers(u||[])).catch(()=>{});
-    })();
-  },[]);
-  useEffect(()=>{if(!selProject)return;setAsanaLoad(true);getTasks(selProject).then(t=>{setTasks(t||[]);setAsanaLoad(false);}).catch(()=>setAsanaLoad(false));},[selProject]);
-  const team=dbUsers.length?dbUsers.map(u=>({name:u.name,area:u.area||"Sin área"})):members.map(m=>({name:m.name,area:"Asana"}));
-  const send=async()=>{
-    const msg=input.trim(); if(!msg||loading) return;
-    setInput(""); setParsed(null); setCreateMsg("");
+    if(mod==="Tareas"&&asanaData.selProject){
+      const t = asanaData.tasks || [];
+      setTasks(t);
+    }
+  },[mod,asanaData]);
+
+  const SYS_MOD = {
+    Brief: `Sos estratega de agencia 360. Dado un brief, extraé: cliente, objetivo, target, presupuesto, canales, plazo, tono, insight, KPIs. Respondé en formato claro con secciones.`,
+    Estrategia: `Sos estratega creativo de agencia 360 argentina. Cliente: ${client?.name}. Proyecto: ${project?.name}. Brief: ${project?.modules?.Brief||"No disponible"}. Proponé insight central + 3 territorios creativos distintos + pregunta clave.`,
+    Concepto: `Sos director creativo de agencia 360 argentina. Cliente: ${client?.name}. Brief: ${project?.modules?.Brief||""}. Estrategia: ${project?.modules?.Estrategia||""}. Desarrollá el concepto creativo: nombre de campaña, idea central, tagline, y guía de tono visual.`,
+    Medios: `Sos especialista en medios y performance. Cliente: ${client?.name}. Objetivo: ${project?.modules?.Brief||""}. Recomendá plan de medios: canales, distribución de presupuesto %, formatos por canal, KPIs y cronograma.`,
+    Tareas: `Sos PM de agencia 360. Equipo disponible: ${(asanaData.members||[]).map(m=>m.name).join(", ")}. Brief: ${project?.modules?.Brief||""}. Dado un proyecto, respondé SOLO con JSON: {"resumen":"...","tareas":[{"nombre":"...","responsable":"nombre","prioridad":"alta|media|baja","deadline":"X días","notas":"..."}],"riesgos":"..."}`,
+    Email: `Sos el agente de comunicación de la agencia. Cliente: ${client?.name}. Dado un email, respondé:\n---CLASIFICACIÓN---\nTipo: [Cliente/Proveedor/Prospecto/Interno]\nUrgencia: [Alta/Media/Baja]\nResumen: [1 oración]\n---BORRADOR---\n[respuesta completa]\n---ASUNTO SUGERIDO---\n[asunto]`,
+    Archivos: `Sos el asistente de la agencia. Ayudás a organizar archivos y documentos del proyecto ${project?.name} del cliente ${client?.name}.`,
+  };
+
+  const send = async (txt) => {
+    const msg = (txt||input).trim(); if(!msg||loading) return;
+    setInput("");
     setMsgs(p=>[...p,{role:"user",text:msg}]); setLoading(true);
-    try{
-      const r=await callClaude(user.apiKey,SYS_PROY(user.role,user.name,team,activeBrief),msg,msgs.map(m=>({role:m.role,content:m.text})));
+    try {
+      const r = await claude(user.apiKey, SYS_MOD[mod]||SYS_MOD.Brief, msg, msgs.slice(-4).map(m=>({role:m.role,content:m.text})));
       setMsgs(p=>[...p,{role:"assistant",text:r}]);
-      await logAct({userId:user.id,userName:user.name,userRole:user.role,module:"proyectos",action:msg.slice(0,60)});
-      try{const j=JSON.parse(r.replace(/```json|```/g,"").trim());setParsed(j);}catch(e){}
-    }catch(e){setMsgs(p=>[...p,{role:"assistant",text:"❌ "+e.message}]);}
+      if(mod==="Tareas") { try{const j=JSON.parse(r.replace(/```json|```/g,"").trim());setParsed(j);}catch{} }
+    } catch(e) { setMsgs(p=>[...p,{role:"assistant",text:"❌ "+e.message}]); }
     setLoading(false);
   };
-  const createInAsana=async()=>{
-    if(!selWs){setCreateMsg("❌ Sin workspace");return;}
-    setCreating(true);setCreateMsg("");
-    try{
-      const name=(activeBrief?`[${activeBrief.cliente}] `:"")+( parsed?.resumen?.slice(0,50)||"Proyecto Aldea");
-      const proj=await createProj(selWs,name); let n=0;
-      for(const t of parsed?.tareas||[]){
-        const m=members.find(x=>x.name.toLowerCase().includes((t.responsable||"").toLowerCase().split(" ")[0]));
-        await createTask(proj.gid,{name:t.nombre,notes:`Prioridad: ${t.prioridad||"media"}\nDeadline: ${t.deadline||"TBD"}\n${t.notas||""}`,assigneeGid:m?.gid||null});n++;
+
+  const createInAsana = async () => {
+    if(!asanaData.selWs||!parsed) return;
+    setCreating(true); setCreateMsg("");
+    try {
+      const name = `[${client?.name}] ${project?.name} — ${mod}`;
+      const proj = await createProj(asanaData.selWs, name);
+      let n=0;
+      for(const t of parsed.tareas||[]) {
+        const m = (asanaData.members||[]).find(x=>x.name.toLowerCase().includes((t.responsable||"").toLowerCase().split(" ")[0]));
+        await createTask(proj.gid,{name:t.nombre,notes:`Prioridad: ${t.prioridad}\nDeadline: ${t.deadline}\n${t.notas||""}`,assigneeGid:m?.gid||null});
+        n++;
       }
-      setCreateMsg(`✓ "${name}" creado con ${n} tareas en Asana`);
-      await logAct({userId:user.id,userName:user.name,userRole:user.role,module:"proyectos",action:`Asana: ${name}`});
-      const updated=await getProjs(selWs);setProjects(updated||[]);setSelProject(proj.gid);
-    }catch(e){setCreateMsg("❌ "+e.message);}
+      setCreateMsg(`✓ ${n} tareas creadas en Asana`);
+    } catch(e) { setCreateMsg("❌ "+e.message); }
     setCreating(false);
   };
-  const TMPL=["Lanzamiento de campaña para cliente nuevo, 3 semanas","Entrega de identidad de marca: logo, paleta, tipografía","Producción de 20 posts mensuales para redes","Pitch para prospecto: presentación + propuesta"];
-  return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}}>
-      <MH icon="📋" title="Proyectos & Asana" sub="El agente divide el proyecto en tareas y las crea en Asana"
-        right={<div style={{display:"flex",gap:5}}>
-          <button onClick={()=>setView("chat")} style={{...btnS,fontSize:12,padding:"5px 10px",background:view==="chat"?"var(--border2)":"var(--card)"}}>💬 Agente</button>
-          <button onClick={()=>setView("asana")} style={{...btnS,fontSize:12,padding:"5px 10px",background:view==="asana"?"var(--border2)":"var(--card)"}}>🔗 Asana</button>
-        </div>}
-      />
-      <BriefBar briefs={briefs} activeBrief={activeBrief} onSelect={onSelectBrief}/>
-      {view==="asana"?(
-        <div style={{flex:1,overflowY:"auto"}}>
-          <div style={{marginBottom:12}}>
-            <label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Workspace</label>
-            <select value={selWs} onChange={e=>setSelWs(e.target.value)} style={{...inp,marginBottom:10,appearance:"none"}}>{ws.map(w=><option key={w.gid} value={w.gid}>{w.name}</option>)}</select>
-            <label style={{fontSize:11,color:"var(--muted2)",display:"block",marginBottom:5,textTransform:"uppercase",letterSpacing:".08em"}}>Proyecto</label>
-            <select value={selProject} onChange={e=>setSelProject(e.target.value)} style={{...inp,appearance:"none"}}><option value="">— Seleccioná un proyecto —</option>{projects.map(p=><option key={p.gid} value={p.gid}>{p.name}</option>)}</select>
+
+  const color = MODULE_COLORS[mod]||"var(--muted2)";
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%",background:"var(--card)"}}>
+      {/* Module header */}
+      <div style={{padding:"11px 16px",borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
+        <div style={{width:8,height:8,borderRadius:"50%",background:color,flexShrink:0}}/>
+        <span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:13,flex:1}}>{mod}</span>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"var(--muted)",fontSize:17,padding:"0 2px"}}>×</button>
+      </div>
+
+      {/* Content area */}
+      <div style={{flex:1,overflowY:"auto",padding:"12px 14px",display:"flex",flexDirection:"column",gap:10}}>
+
+        {/* Editable content for Brief, Estrategia, Concepto, Medios */}
+        {["Brief","Estrategia","Concepto","Medios"].includes(mod) && (
+          <div>
+            <textarea value={content} onChange={e=>setContent(e.target.value)}
+              placeholder={`Escribí o pegá el ${mod.toLowerCase()} acá, o usá el agente abajo para generarlo...`}
+              rows={6} style={{...S.inp,width:"100%",marginBottom:6,fontSize:12.5,lineHeight:1.6}}/>
+            <button onClick={()=>setSaved(true)} style={{...S.btnS,fontSize:11.5,padding:"5px 10px"}}>
+              {saved?"✓ Guardado":"💾 Guardar"}
+            </button>
           </div>
-          {asanaLoad?<div style={{display:"flex",gap:8,color:"var(--muted)",padding:16,alignItems:"center"}}><Spin/>Cargando tareas...</div>
-          :selProject&&tasks.length>0?tasks.map(t=>(
-            <div key={t.gid} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",marginBottom:5,display:"flex",alignItems:"center",gap:10}}>
-              <div style={{width:13,height:13,borderRadius:"50%",border:"2px solid",borderColor:t.completed?"var(--green)":"var(--border2)",background:t.completed?"var(--green)":"transparent",flexShrink:0}}/>
-              <div style={{flex:1}}><div style={{fontSize:13,color:t.completed?"var(--muted)":"var(--text)",textDecoration:t.completed?"line-through":"none"}}>{t.name}</div>{t.assignee&&<div style={{fontSize:11,color:"var(--muted2)"}}>{t.assignee.name}</div>}</div>
-              {t.due_on&&<div style={{fontSize:11,color:"var(--amber)"}}>{t.due_on}</div>}
-            </div>
-          )):<div style={{textAlign:"center",padding:"40px 20px",color:"var(--muted)",fontSize:13}}>{selProject?"Sin tareas.":"Seleccioná un proyecto."}</div>}
-        </div>
-      ):(
-        <>
-          {msgs.length===0&&<div style={{marginBottom:10}}><div style={{fontSize:11,color:"var(--muted)",marginBottom:6,textTransform:"uppercase",letterSpacing:".08em"}}>Ejemplos</div><div style={{display:"flex",flexWrap:"wrap",gap:6}}>{TMPL.map((t,i)=><button key={i} onClick={()=>setInput(t)} style={{...btnS,fontSize:12,padding:"5px 10px"}}>{t}</button>)}</div></div>}
-          <div style={{flex:1,overflowY:"auto",minHeight:120,maxHeight:240,paddingBottom:8}}>
-            {msgs.map((m,i)=><Bubble key={i} {...m}/>)}
-            {loading&&<Typing/>}<div ref={bottom}/>
-          </div>
-          {parsed&&<div className="fu" style={{background:"#b8ff5712",border:"1px solid #b8ff5730",borderRadius:10,padding:12,margin:"8px 0"}}>
-            <div style={{fontSize:11,color:"var(--accent)",fontWeight:700,marginBottom:6,textTransform:"uppercase",letterSpacing:".08em"}}>✦ {parsed.tareas?.length||0} tareas</div>
-            <div style={{marginBottom:8,maxHeight:100,overflowY:"auto"}}>{(parsed.tareas||[]).map((t,i)=><div key={i} style={{display:"flex",gap:7,marginBottom:3,fontSize:12.5}}><span style={{color:t.prioridad==="alta"?"var(--red)":t.prioridad==="media"?"var(--amber)":"var(--green)",flexShrink:0}}>{t.prioridad==="alta"?"🔴":t.prioridad==="media"?"🟡":"🟢"}</span><span style={{flex:1}}>{t.nombre}</span><span style={{color:"var(--muted2)",flexShrink:0}}>→ {t.responsable}</span></div>)}</div>
-            {parsed.riesgos&&<div style={{fontSize:12,color:"var(--amber)",marginBottom:8}}>⚠️ {parsed.riesgos}</div>}
-            {createMsg?<div style={{fontSize:13,color:createMsg.startsWith("✓")?"var(--green)":"var(--red)"}}>{createMsg}</div>:(
-              <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                <select value={selWs} onChange={e=>setSelWs(e.target.value)} style={{...inp,width:"auto",fontSize:12,padding:"5px 9px",appearance:"none"}}>{ws.map(w=><option key={w.gid} value={w.gid}>{w.name}</option>)}</select>
-                <button onClick={createInAsana} disabled={creating||!selWs} style={{...btnP(),padding:"7px 12px",fontSize:13,display:"flex",alignItems:"center",gap:5,opacity:creating?.6:1}}>{creating?<><Spin/>Creando...</>:"🚀 Crear en Asana"}</button>
+        )}
+
+        {/* Tasks view */}
+        {mod==="Tareas" && (
+          <div>
+            {tasks.length>0 ? (
+              <div>
+                <div style={{fontSize:11,color:"var(--muted)",marginBottom:8,textTransform:"uppercase",letterSpacing:".08em"}}>{tasks.length} tareas en Asana</div>
+                {tasks.map(t=>(
+                  <div key={t.gid} style={{background:"var(--card2)",border:"1px solid var(--border)",borderRadius:8,padding:"8px 11px",marginBottom:5,display:"flex",gap:8,alignItems:"flex-start"}}>
+                    <div style={{width:12,height:12,borderRadius:"50%",border:"2px solid",borderColor:t.completed?"var(--green)":"var(--border2)",background:t.completed?"var(--green)":"transparent",flexShrink:0,marginTop:2}}/>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:12.5,color:t.completed?"var(--muted)":"var(--text)",textDecoration:t.completed?"line-through":"none"}}>{t.name}</div>
+                      {t.assignee&&<div style={{fontSize:11,color:"var(--muted2)"}}>{t.assignee.name}</div>}
+                    </div>
+                    {t.due_on&&<div style={{fontSize:10.5,color:"var(--amber)",flexShrink:0}}>{t.due_on}</div>}
+                  </div>
+                ))}
+              </div>
+            ) : <div style={{fontSize:12.5,color:"var(--muted)",textAlign:"center",padding:"20px 0"}}>No hay tareas todavía. Usá el agente para generarlas.</div>}
+
+            {parsed && (
+              <div style={{background:"#b8ff5710",border:"1px solid #b8ff5730",borderRadius:10,padding:12,marginTop:10}}>
+                <div style={{fontSize:11,color:"var(--accent)",fontWeight:700,marginBottom:6,textTransform:"uppercase",letterSpacing:".08em"}}>✦ {parsed.tareas?.length||0} tareas generadas</div>
+                {(parsed.tareas||[]).map((t,i)=>(
+                  <div key={i} style={{display:"flex",gap:6,marginBottom:4,fontSize:12}}>
+                    <span style={{color:t.prioridad==="alta"?"var(--red)":t.prioridad==="media"?"var(--amber)":"var(--green)",flexShrink:0}}>{t.prioridad==="alta"?"🔴":"🟡"}</span>
+                    <span style={{flex:1}}>{t.nombre}</span>
+                    <span style={{color:"var(--muted2)",flexShrink:0,fontSize:11}}>→{t.responsable}</span>
+                  </div>
+                ))}
+                {createMsg ? <div style={{fontSize:12,color:createMsg.startsWith("✓")?"var(--green)":"var(--red)",marginTop:8}}>{createMsg}</div> : (
+                  <button onClick={createInAsana} disabled={creating} style={{...S.btnP(),padding:"7px 12px",fontSize:12,marginTop:8,display:"flex",alignItems:"center",gap:5,opacity:creating?.6:1}}>
+                    {creating?<><Spin size={12}/>Creando...</>:"🚀 Crear en Asana"}
+                  </button>
+                )}
               </div>
             )}
-          </div>}
-          <div style={{display:"flex",gap:8,paddingTop:10,borderTop:"1px solid var(--border)"}}>
-            <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Describí el proyecto..." style={{...inp,flex:1}} onKeyDown={e=>e.key==="Enter"&&send()}/>
-            <button onClick={send} disabled={loading||!input.trim()} style={{...btnP(),padding:"11px 18px",opacity:(!input.trim()||loading)?.35:1}}>{loading?"...":"→"}</button>
           </div>
-        </>
-      )}
+        )}
+
+        {/* Email view */}
+        {mod==="Email" && (
+          <div style={{fontSize:12.5,color:"var(--muted2)"}}>Pegá un email del cliente en el chat del agente ↓ y lo clasifico y redacto la respuesta.</div>
+        )}
+
+        {/* Archivos view */}
+        {mod==="Archivos" && (
+          <div style={{border:"2px dashed var(--border2)",borderRadius:10,padding:24,textAlign:"center",color:"var(--muted)"}}>
+            <div style={{fontSize:24,marginBottom:8}}>📎</div>
+            <div style={{fontSize:12.5}}>Arrastrá archivos acá para adjuntarlos al proyecto</div>
+            <div style={{fontSize:11,marginTop:4}}>PDF, imágenes, documentos</div>
+          </div>
+        )}
+
+        {/* Chat messages */}
+        <div style={{borderTop:"1px solid var(--border)",paddingTop:10}}>
+          <div style={{fontSize:11,color:"var(--muted)",marginBottom:6,textTransform:"uppercase",letterSpacing:".08em"}}>Agente → {mod}</div>
+          {msgs.length===0 && (
+            <div style={{fontSize:12,color:"var(--muted2)",marginBottom:8}}>
+              {mod==="Brief"&&"Pegá el brief del cliente y lo analizo."}
+              {mod==="Estrategia"&&"Pedime territorios creativos o análisis estratégico."}
+              {mod==="Concepto"&&"Pedime el concepto creativo basado en la estrategia."}
+              {mod==="Medios"&&"Pedime el plan de medios y distribución de presupuesto."}
+              {mod==="Tareas"&&"Describí el proyecto y lo divido en tareas para el equipo."}
+              {mod==="Email"&&"Pegá el email del cliente y lo analizo."}
+            </div>
+          )}
+          <div style={{maxHeight:200,overflowY:"auto"}}>
+            {msgs.map((m,i)=><Bubble key={i} {...m}/>)}
+            {loading&&<Typing/>}
+            <div ref={bottom}/>
+          </div>
+        </div>
+      </div>
+
+      {/* Input */}
+      <div style={{padding:"8px 12px",borderTop:"1px solid var(--border)",display:"flex",gap:6,flexShrink:0}}>
+        <input value={input} onChange={e=>setInput(e.target.value)}
+          placeholder={mod==="Brief"?"Pegá el brief...":`Preguntale al agente sobre ${mod}...`}
+          style={{...S.inp,flex:1,fontSize:12,padding:"7px 10px"}}
+          onKeyDown={e=>e.key==="Enter"&&send()}/>
+        <button onClick={()=>send()} disabled={loading||!input.trim()} style={{...S.btnP(),padding:"7px 12px",opacity:(!input.trim()||loading)?.35:1}}>→</button>
+      </div>
     </div>
   );
 }
 
-// ── ESTRATEGIA ────────────────────────────────────────────────────────────────
-function EstrategiaModule({user,briefs,activeBrief,onSelectBrief}){
-  const [input,setInput]=useState(""); const [msgs,setMsgs]=useState([]); const [loading,setLoading]=useState(false);
-  const bottom=useRef();
-  useEffect(()=>{bottom.current?.scrollIntoView({behavior:"smooth"});},[msgs,loading]);
-  const PROMPTS=["Analizá el brief activo y proponé territorios creativos","Marca de ropa sustentable quiere crecer en Instagram","Restaurante nuevo busca diferenciarse en Palermo","App de delivery vs PedidosYa y Rappi"];
-  const send=async(txt)=>{
-    const msg=(txt||input).trim(); if(!msg||loading) return; setInput("");
-    setMsgs(p=>[...p,{role:"user",text:msg}]); setLoading(true);
-    try{
-      const r=await callClaude(user.apiKey,SYS_EST(user.role,user.name,activeBrief),msg,msgs.map(m=>({role:m.role,content:m.text})));
-      setMsgs(p=>[...p,{role:"assistant",text:r}]);
-      await logAct({userId:user.id,userName:user.name,userRole:user.role,module:"estrategia",action:msg.slice(0,60)});
-    }catch(e){setMsgs(p=>[...p,{role:"assistant",text:"❌ "+e.message}]);}
-    setLoading(false);
-  };
-  return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}}>
-      <MH icon="💡" title="Estrategia & Brainstorming" sub="Insight estratégico y territorios creativos con contexto del brief"/>
-      <BriefBar briefs={briefs} activeBrief={activeBrief} onSelect={onSelectBrief}/>
-      {msgs.length===0&&<div style={{marginBottom:10}}><div style={{fontSize:11,color:"var(--muted)",marginBottom:6,textTransform:"uppercase",letterSpacing:".08em"}}>Ejemplos</div><div style={{display:"flex",flexWrap:"wrap",gap:6}}>{PROMPTS.map((p,i)=><button key={i} onClick={()=>send(p)} style={{...btnS,fontSize:12,padding:"5px 10px",maxWidth:280}}>{p}</button>)}</div></div>}
-      <div style={{flex:1,overflowY:"auto",minHeight:220,maxHeight:340,paddingBottom:8}}>
-        {msgs.map((m,i)=><Bubble key={i} {...m}/>)}
-        {loading&&<Typing/>}<div ref={bottom}/>
-      </div>
-      <div style={{display:"flex",gap:8,paddingTop:10,borderTop:"1px solid var(--border)"}}>
-        <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Describí el desafío o pedí análisis del brief activo..." style={{...inp,flex:1}} onKeyDown={e=>e.key==="Enter"&&send()}/>
-        <button onClick={()=>send()} disabled={loading||!input.trim()} style={{...btnP(),padding:"11px 18px",opacity:(!input.trim()||loading)?.35:1}}>{loading?"...":"→"}</button>
-      </div>
-    </div>
-  );
-}
-
-// ── CAMPAÑAS ──────────────────────────────────────────────────────────────────
-function CampanasModule({user,briefs,activeBrief,onSelectBrief}){
-  const FIELDS=[{key:"marca",label:"¿Para qué marca o cliente?",ph:"Ej: Café Oculto"},{key:"producto",label:"¿Qué se comunica?",ph:"Ej: Lanzamiento"},{key:"objetivo",label:"¿Cuál es el objetivo?",ph:"Ej: Awareness + ventas"},{key:"target",label:"¿Quién es el público?",ph:"Ej: Adultos 28-45"},{key:"budget",label:"¿Presupuesto aproximado?",ph:"Ej: USD 5.000/mes"},{key:"canales",label:"¿Qué canales tienen?",ph:"Ej: Instagram, TikTok, Google"}];
-  const [step,setStep]=useState(0); const [brief,setBrief]=useState({}); const [result,setResult]=useState(""); const [loading,setLoading]=useState(false); const [saved,setSaved]=useState(false); const [fromBrief,setFromBrief]=useState(false);
+// ── PROJECT VIEW ──────────────────────────────────────────────────────────────
+function ProjectView({project, client, user, onBack}) {
+  const [activeModules, setActiveModules] = useState(["Brief","Tareas"]);
+  const [openModule, setOpenModule] = useState("Brief");
+  const [asanaWs, setAsanaWs] = useState([]);
+  const [selWs, setSelWs] = useState("");
+  const [asanaProjects, setAsanaProjects] = useState([]);
+  const [selProject, setSelProject] = useState("");
+  const [asanaTasks, setAsanaTasks] = useState([]);
+  const [asanaMembers, setAsanaMembers] = useState([]);
+  const [showChat, setShowChat] = useState(true);
 
   useEffect(()=>{
-    if(activeBrief&&!fromBrief&&step===0&&!result){
-      setBrief({marca:activeBrief.cliente||"",producto:activeBrief.producto||"",objetivo:activeBrief.objetivo||"",target:activeBrief.target||"",budget:activeBrief.presupuesto||"",canales:activeBrief.canales||""});
-      setFromBrief(true);
-    }
-  },[activeBrief]);
+    (async()=>{
+      try {
+        const w = await getWS(); setAsanaWs(w||[]);
+        if(w&&w.length) {
+          setSelWs(w[0].gid);
+          const [p,m] = await Promise.all([getProjs(w[0].gid),getMembers(w[0].gid)]);
+          setAsanaProjects(p||[]); setAsanaMembers(m||[]);
+        }
+      } catch(e) { console.error(e); }
+    })();
+  },[]);
 
-  const next=async()=>{
-    if(step<FIELDS.length-1){setStep(s=>s+1);return;}
-    setLoading(true);
-    const txt=FIELDS.map(f=>`${f.key.toUpperCase()}: ${brief[f.key]||"No especificado"}`).join("\n");
-    try{
-      const r=await callClaude(user.apiKey,SYS_CAMP(user.role,user.name,activeBrief),`Brief:\n\n${txt}`);
-      setResult(r); await logAct({userId:user.id,userName:user.name,userRole:user.role,module:"campanas",action:`Campaña: ${brief.marca||"sin nombre"}`});
-    }catch(e){setResult("❌ "+e.message);}
-    setLoading(false);
+  useEffect(()=>{
+    if(selProject) getTasks(selProject).then(t=>setAsanaTasks(t||[])).catch(()=>{});
+  },[selProject]);
+
+  const asanaData = {ws:asanaWs,selWs,projects:asanaProjects,selProject,tasks:asanaTasks,members:asanaMembers};
+  const colors = ["var(--accent)","var(--purple)","var(--blue)","var(--pink)","var(--amber)","var(--teal)"];
+  const clientColor = colors[client?.name?.charCodeAt(0) % colors.length] || "var(--accent)";
+
+  const toggleModule = mod => {
+    setActiveModules(p => p.includes(mod) ? p.filter(m=>m!==mod) : [...p,mod]);
+    if(!activeModules.includes(mod)) setOpenModule(mod);
   };
 
-  const reset=()=>{setStep(0);setBrief({});setResult("");setSaved(false);setFromBrief(false);};
+  return (
+    <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"var(--bg)"}}>
+      {/* Header */}
+      <div style={{height:48,borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",gap:12,padding:"0 18px",background:"var(--surface)",flexShrink:0}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"var(--muted2)",fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>← Clientes</button>
+        <div style={{width:1,height:18,background:"var(--border)"}}/>
+        <span style={{fontSize:12,color:"var(--muted2)"}}>{client?.name}</span>
+        <div style={{width:1,height:18,background:"var(--border)"}}/>
+        <div style={{width:6,height:6,borderRadius:"50%",background:clientColor}}/>
+        <span style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14}}>{project?.name}</span>
+        {project?.status&&<Tag color={project.status==="activo"?"var(--green)":"var(--amber)"} small>{project.status}</Tag>}
+        <div style={{flex:1}}/>
+        <button onClick={()=>setShowChat(p=>!p)} style={{...S.btnS,fontSize:12,padding:"5px 10px",background:showChat?"var(--border2)":"var(--card2)"}}>💬 Agente</button>
+      </div>
 
-  if(loading) return <div style={{display:"flex",flexDirection:"column",flex:1,alignItems:"center",justifyContent:"center",gap:14}}><div style={{fontSize:34,animation:"spin 2.5s linear infinite"}}>✦</div><div style={{color:"var(--muted2)",fontSize:14}}>Generando campaña 360...</div></div>;
-  if(result) return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}} className="fu">
-      <MH icon="🎨" title="Campañas 360" sub={`Campaña para ${brief.marca||"tu cliente"}`}
-        right={<div style={{display:"flex",gap:7}}>
-          <button onClick={async()=>{await saveConv(user.id,"campanas",[{role:"user",text:FIELDS.map(f=>`${f.key}: ${brief[f.key]||""}`).join("\n")},{role:"assistant",text:result}],{title:`Campaña: ${brief.marca||"Sin nombre"}`,userName:user.name});setSaved(true);setTimeout(()=>setSaved(false),2500);}} disabled={saved} style={{...btnS,fontSize:12,padding:"5px 11px"}}>{saved?"✓ Guardada":"💾 Guardar"}</button>
-          <button onClick={reset} style={{...btnS,fontSize:12,padding:"5px 11px"}}>+ Nueva</button>
-        </div>}
-      />
-      <div style={{flex:1,background:"var(--card)",border:"1px solid var(--border)",borderRadius:10,padding:20,fontSize:13.5,lineHeight:1.78,whiteSpace:"pre-wrap",overflowY:"auto",maxHeight:460}}>{result}</div>
-    </div>
-  );
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+        {/* Left: Module selector + panels */}
+        <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+          {/* Module tabs */}
+          <div style={{display:"flex",gap:6,padding:"10px 16px",borderBottom:"1px solid var(--border)",background:"var(--surface)",flexShrink:0,overflowX:"auto"}}>
+            {PROJECT_MODULES.map(mod=>(
+              <button key={mod} onClick={()=>{toggleModule(mod);setOpenModule(mod);}}
+                style={{...S.btnS,fontSize:12,padding:"5px 11px",
+                  background:activeModules.includes(mod)?MODULE_COLORS[mod]+"22":"var(--card2)",
+                  color:activeModules.includes(mod)?MODULE_COLORS[mod]:"var(--muted)",
+                  border:`1px solid ${activeModules.includes(mod)?MODULE_COLORS[mod]+"44":"var(--border2)"}`,
+                  whiteSpace:"nowrap"}}>
+                {mod}
+              </button>
+            ))}
+          </div>
 
-  const f=FIELDS[step];
-  return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}}>
-      <MH icon="🎨" title="Generador de Campañas" sub="6 preguntas → campaña 360 completa"/>
-      <BriefBar briefs={briefs} activeBrief={activeBrief} onSelect={onSelectBrief}/>
-      {activeBrief&&fromBrief&&<div style={{fontSize:12,color:"var(--green)",marginBottom:10}}>✓ Datos pre-cargados desde el brief de {activeBrief.cliente}</div>}
-      <div style={{display:"flex",gap:4,marginBottom:18}}>{FIELDS.map((_,i)=><div key={i} style={{height:3,flex:1,borderRadius:2,background:i<=step?"var(--accent)":"var(--border2)",transition:"background .3s"}}/>)}</div>
-      <div className="fu" key={step}>
-        <div style={{fontSize:11,color:"var(--muted)",marginBottom:6,textTransform:"uppercase",letterSpacing:".08em"}}>Paso {step+1} / {FIELDS.length}</div>
-        <div style={{fontFamily:"'Syne',sans-serif",fontSize:19,fontWeight:700,marginBottom:14}}>{f.label}</div>
-        <input key={step} value={brief[f.key]||""} onChange={e=>setBrief(p=>({...p,[f.key]:e.target.value}))} placeholder={f.ph} style={{...inp,marginBottom:14,fontSize:15}} onKeyDown={e=>e.key==="Enter"&&next()} autoFocus/>
-        <div style={{display:"flex",gap:8}}>{step>0&&<button onClick={()=>setStep(s=>s-1)} style={btnS}>← Atrás</button>}<button onClick={next} style={{...btnP(),padding:"11px 22px"}}>{step===FIELDS.length-1?"Generar campaña ✦":"Siguiente →"}</button></div>
+          {/* Active module panel */}
+          <div style={{flex:1,overflow:"hidden"}}>
+            {openModule && activeModules.includes(openModule) ? (
+              <ModulePanel
+                mod={openModule}
+                project={project}
+                client={client}
+                user={user}
+                asanaData={asanaData}
+                onClose={()=>setActiveModules(p=>p.filter(m=>m!==openModule))}
+              />
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",color:"var(--muted)",gap:12}}>
+                <div style={{fontSize:32}}>📋</div>
+                <div style={{fontSize:14}}>Seleccioná un módulo arriba para empezar</div>
+                <div style={{fontSize:12,color:"var(--muted)"}}>Brief → Estrategia → Concepto → Medios → Tareas</div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right: Agent chat */}
+        {showChat && (
+          <div style={{width:300,borderLeft:"1px solid var(--border)",display:"flex",flexDirection:"column",flexShrink:0}}>
+            <AgentChat user={user} context={`Proyecto "${project?.name}" del cliente ${client?.name}. Módulo activo: ${openModule}`} onClose={()=>setShowChat(false)}/>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-// ── EQUIPO ────────────────────────────────────────────────────────────────────
-function EquipoModule({user}){
-  const [dbUsers,setDbUsers]=useState([]); const [asanaM,setAsanaM]=useState([]); const [activity,setActivity]=useState([]); const [tab,setTab]=useState("miembros"); const [loading,setLoading]=useState(true);
-  const isDir=user.role==="director";
-  useEffect(()=>{(async()=>{setLoading(true);try{const [u,w]=await Promise.all([getAllUsers(),getWS()]);setDbUsers(u||[]);if(w&&w.length){const m=await getMembers(w[0].gid);setAsanaM(m||[]);}if(isDir){const a=await getDocs(query(collection(db,"activity"),orderBy("ts","desc"),limit(60)));setActivity(a.docs.map(d=>({id:d.id,...d.data()})));}}catch(e){}setLoading(false);})();},[isDir]);
-  const fmtTs=ts=>{if(!ts)return"";const d=ts.toDate?ts.toDate():new Date(ts);const s=Math.floor((Date.now()-d.getTime())/1e3);if(s<60)return"ahora";if(s<3600)return`hace ${Math.floor(s/60)}m`;if(s<86400)return`hace ${Math.floor(s/3600)}h`;return`hace ${Math.floor(s/86400)}d`;};
-  return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}}>
-      <MH icon="👥" title="Equipo Aldea" sub="Miembros, áreas y actividad en tiempo real"/>
-      <div style={{display:"flex",gap:6,marginBottom:14,alignItems:"center"}}>
-        {["miembros","asana",...(isDir?["actividad"]:[])].map(t=><button key={t} onClick={()=>setTab(t)} style={{...btnS,fontSize:12,padding:"5px 12px",background:tab===t?"var(--border2)":"var(--card)",color:tab===t?"var(--text)":"var(--muted)"}}>{t==="miembros"?"👤 Equipo":t==="asana"?"🔗 Asana":"📊 Actividad"}</button>)}
-        <span style={{marginLeft:"auto",fontSize:11,color:"var(--muted)",display:"flex",alignItems:"center",gap:5}}><span style={{width:6,height:6,borderRadius:"50%",background:"var(--green)",display:"inline-block",animation:"pulse 2s infinite"}}/>{dbUsers.length} miembro{dbUsers.length!==1?"s":""}</span>
-      </div>
-      {loading?<div style={{display:"flex",gap:8,color:"var(--muted)",padding:16,alignItems:"center"}}><Spin/>Cargando...</div>
-      :tab==="miembros"?(<div style={{flex:1,overflowY:"auto",maxHeight:420}}>{dbUsers.length===0?<div style={{textAlign:"center",padding:40,color:"var(--muted)",fontSize:13}}>No hay miembros todavía.</div>:dbUsers.map(u=>{const r=ROLES[u.role];const ar=AREAS[u.area];return(<div key={u.id} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:10,padding:"12px 14px",marginBottom:6,display:"flex",alignItems:"center",gap:12}}><div style={{width:36,height:36,borderRadius:"50%",background:(r?.color||"var(--muted)")+"22",border:`1px solid ${r?.color||"var(--muted)"}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,flexShrink:0}}>{r?.icon||"?"}</div><div style={{flex:1,minWidth:0}}><div style={{fontWeight:600,fontSize:13.5,marginBottom:4}}>{u.name}{u.id===user.id&&<span style={{fontSize:10,color:"var(--muted)",marginLeft:6}}>(vos)</span>}</div><div style={{display:"flex",gap:5,flexWrap:"wrap"}}><Tag color={r?.color||"var(--muted)"}>{r?.label||u.role}</Tag>{u.area&&ar&&<Tag color={ar.color}>{ar.icon} {u.area}</Tag>}</div></div></div>);})}</div>)
-      :tab==="asana"?(<div style={{flex:1,overflowY:"auto",maxHeight:420}}><div style={{fontSize:11,color:"var(--muted)",marginBottom:8,textTransform:"uppercase",letterSpacing:".08em"}}>{asanaM.length} en Asana</div>{asanaM.map(m=>(<div key={m.gid} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:9,padding:"9px 12px",marginBottom:5,display:"flex",alignItems:"center",gap:10}}><div style={{width:30,height:30,borderRadius:"50%",background:"var(--border2)",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"var(--accent)"}}>{m.name?m.name[0].toUpperCase():"?"}</div><div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{m.name}</div><div style={{fontSize:11,color:"var(--muted2)"}}>{m.email}</div></div><div style={{width:7,height:7,borderRadius:"50%",background:"var(--green)",animation:"pulse 2s infinite"}}/></div>))}</div>)
-      :(<div style={{flex:1,overflowY:"auto",maxHeight:420}}>{activity.length===0?<div style={{textAlign:"center",padding:40,color:"var(--muted)",fontSize:13}}>Sin actividad todavía.</div>:activity.map((a,i)=>{const r=ROLES[a.userRole];return(<div key={i} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"8px 11px",background:"var(--card)",border:"1px solid var(--border)",borderRadius:8,marginBottom:5}}><div style={{width:24,height:24,borderRadius:"50%",background:(r?.color||"var(--muted)")+"22",flexShrink:0,marginTop:1,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10}}>{r?.icon||"?"}</div><div style={{flex:1,minWidth:0}}><div style={{fontSize:12.5,marginBottom:1}}><strong style={{color:r?.color||"var(--text)"}}>{a.userName}</strong> <span style={{color:"var(--muted2)"}}>en</span> <span style={{color:MC[a.module]||"var(--muted)"}}>{ML[a.module]||a.module}</span></div><div style={{fontSize:11.5,color:"var(--muted2)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{a.action}</div></div><div style={{fontSize:11,color:"var(--muted)",flexShrink:0}}>{fmtTs(a.ts)}</div></div>);})}</div>)}
-    </div>
-  );
-}
+// ── CLIENT VIEW ───────────────────────────────────────────────────────────────
+function ClientView({client, user, onBack}) {
+  const [projects, setProjects] = useState([]);
+  const [showNewProj, setShowNewProj] = useState(false);
+  const [newProjName, setNewProjName] = useState("");
+  const [openProject, setOpenProject] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-// ── HISTORIAL ─────────────────────────────────────────────────────────────────
-function HistorialModule({user}){
-  const [convs,setConvs]=useState([]); const [loading,setLoading]=useState(true); const [selected,setSelected]=useState(null); const [filter,setFilter]=useState("todos");
-  const isDir=user.role==="director";
-  useEffect(()=>{(async()=>{setLoading(true);const all=isDir?await getAllConvs():(await getAllConvs()).filter(c=>c.userId===user.id);setConvs(all||[]);setLoading(false);})();},[user.id,isDir]);
-  const filtered=filter==="todos"?convs:convs.filter(c=>c.moduleId===filter);
-  const fmt=ts=>{if(!ts)return"";const d=ts.toDate?ts.toDate():new Date(ts);return d.toLocaleDateString("es-AR",{day:"2-digit",month:"short"});};
-  if(selected) return(<div style={{display:"flex",flexDirection:"column",flex:1}}><MH icon="🗂" title={selected.title||"Conversación"} sub={ML[selected.moduleId]||selected.moduleId} right={<button onClick={()=>setSelected(null)} style={{...btnS,fontSize:12,padding:"5px 11px"}}>← Volver</button>}/><div style={{flex:1,overflowY:"auto",maxHeight:480}}>{(selected.messages||[]).map((m,i)=><Bubble key={i} {...m}/>)}</div></div>);
-  return(
-    <div style={{display:"flex",flexDirection:"column",flex:1}}>
-      <MH icon="🗂" title="Historial" sub={isDir?"Todo el historial del equipo":"Tus conversaciones guardadas"}/>
-      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>{["todos","briefs","email","proyectos","estrategia","campanas"].map(f=><button key={f} onClick={()=>setFilter(f)} style={{...btnS,fontSize:11,padding:"4px 10px",background:filter===f?"var(--border2)":"var(--card)",color:filter===f?"var(--text)":"var(--muted)"}}>{f==="todos"?"Todos":ML[f]||f}</button>)}</div>
-      {loading?<div style={{display:"flex",gap:8,color:"var(--muted)",padding:16,alignItems:"center"}}><Spin/>Cargando...</div>
-      :filtered.length===0?<div style={{textAlign:"center",padding:"40px 20px",color:"var(--muted)",fontSize:13}}>No hay conversaciones todavía.</div>
-      :<div style={{flex:1,overflowY:"auto",maxHeight:420}}>{filtered.map(c=>(<div key={c.id} onClick={()=>setSelected(c)} style={{background:"var(--card)",border:"1px solid var(--border)",borderRadius:9,padding:"10px 13px",cursor:"pointer",marginBottom:5,transition:"border .2s"}} onMouseEnter={e=>e.currentTarget.style.borderColor="var(--border2)"} onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}><div style={{display:"flex",justifyContent:"space-between",gap:10}}><div style={{flex:1,minWidth:0}}><div style={{fontSize:13.5,fontWeight:500,marginBottom:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.title||"Sin título"}</div><div style={{display:"flex",gap:6}}><Tag color={MC[c.moduleId]||"var(--muted)"}>{ML[c.moduleId]||c.moduleId}</Tag>{isDir&&c.userName&&<span style={{fontSize:11,color:"var(--muted2)"}}>{c.userName}</span>}</div></div><div style={{fontSize:11,color:"var(--muted)",flexShrink:0,textAlign:"right"}}>{fmt(c.savedAt)}<br/>{(c.messages||[]).length} msgs</div></div></div>))}</div>}
-    </div>
-  );
-}
+  useEffect(()=>{
+    fb.getProjects(client.id).then(p=>{setProjects(p||[]);setLoading(false);}).catch(()=>setLoading(false));
+  },[client.id]);
 
-// ── MAIN ──────────────────────────────────────────────────────────────────────
-export default function App(){
-  const [user,setUser]=useState(null); const [tab,setTab]=useState(null);
-  const [briefs,setBriefs]=useState([]); const [activeBrief,setActiveBrief]=useState(null);
-  const [briefMsg,setBriefMsg]=useState("");
-
-  useEffect(()=>{if(user) getAllBriefs().then(b=>setBriefs(b||[])).catch(()=>{});},[user]);
-
-  const enter=u=>{setUser(u);setTab(ROLES[u.role]?.tabs[0]||"briefs");};
-
-  const handleActivate=b=>{
-    setActiveBrief(b);
-    setBriefMsg(`⚡ Brief de ${b.cliente} activado en todos los módulos`);
-    setTimeout(()=>setBriefMsg(""),3000);
+  const createProject = async () => {
+    if(!newProjName.trim()) return;
+    const id = "proj-"+Date.now().toString(36);
+    const proj = {id,clientId:client.id,name:newProjName.trim(),status:"activo",modules:{},createdAt:Date.now()};
+    await fb.saveProject(proj);
+    setProjects(p=>[proj,...p]);
+    setNewProjName(""); setShowNewProj(false);
+    await fb.logAct({userId:user.id,userName:user.name,module:"proyectos",action:`Proyecto creado: ${proj.name}`});
   };
 
-  if(!user) return <><GlobalStyles/><Setup onEnter={enter}/></>;
-  const role=ROLES[user.role];
-  const tabs=ALL_TABS.filter(t=>role?.tabs.includes(t.id));
+  if(openProject) return <ProjectView project={openProject} client={client} user={user} onBack={()=>setOpenProject(null)}/>;
 
-  return(
+  const colors = ["var(--accent)","var(--purple)","var(--blue)","var(--pink)","var(--amber)","var(--teal)"];
+  const clientColor = colors[client.name.charCodeAt(0) % colors.length];
+
+  return (
+    <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"var(--bg)"}}>
+      {/* Header */}
+      <div style={{height:48,borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",gap:12,padding:"0 20px",background:"var(--surface)",flexShrink:0}}>
+        <button onClick={onBack} style={{background:"none",border:"none",color:"var(--muted2)",fontSize:13,cursor:"pointer"}}>← Clientes</button>
+        <div style={{width:1,height:18,background:"var(--border)"}}/>
+        <div style={{width:8,height:8,borderRadius:"50%",background:clientColor}}/>
+        <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:15}}>{client.name}</span>
+        {client.industry&&<span style={{fontSize:12,color:"var(--muted2)"}}>{client.industry}</span>}
+        {client.status&&<Tag color={client.status==="activo"?"var(--green)":client.status==="prospecto"?"var(--amber)":"var(--muted2)"} small>{client.status}</Tag>}
+        <div style={{flex:1}}/>
+        <button onClick={()=>setShowNewProj(true)} style={{...S.btnP(),padding:"7px 14px",fontSize:12}}>+ Nuevo proyecto</button>
+      </div>
+
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+        {/* Projects list */}
+        <div style={{flex:1,overflowY:"auto",padding:24}}>
+          <div style={{marginBottom:20}}>
+            <div style={{fontFamily:"'Syne',sans-serif",fontSize:14,fontWeight:700,color:"var(--muted2)",textTransform:"uppercase",letterSpacing:".08em",marginBottom:4}}>Proyectos</div>
+            {client.description&&<div style={{fontSize:13,color:"var(--muted2)",maxWidth:600}}>{client.description}</div>}
+          </div>
+
+          {showNewProj && (
+            <div className="fu" style={{...S.card,padding:16,marginBottom:16,display:"flex",gap:8}}>
+              <input value={newProjName} onChange={e=>setNewProjName(e.target.value)} placeholder="Nombre del proyecto..." style={{...S.inp,flex:1}} autoFocus onKeyDown={e=>e.key==="Enter"&&createProject()}/>
+              <button onClick={createProject} disabled={!newProjName.trim()} style={{...S.btnP(),padding:"8px 14px",fontSize:12,opacity:!newProjName.trim()?.5:1}}>Crear</button>
+              <button onClick={()=>setShowNewProj(false)} style={S.btnS}>✕</button>
+            </div>
+          )}
+
+          {loading ? (
+            <div style={{display:"flex",gap:8,color:"var(--muted)",padding:20,alignItems:"center"}}><Spin/>Cargando...</div>
+          ) : projects.length===0 ? (
+            <div style={{textAlign:"center",padding:"60px 20px",color:"var(--muted)"}}>
+              <div style={{fontSize:36,marginBottom:12}}>📋</div>
+              <div style={{fontSize:14,marginBottom:16}}>No hay proyectos todavía</div>
+              <button onClick={()=>setShowNewProj(true)} style={{...S.btnP(),padding:"9px 18px",fontSize:13}}>+ Crear primer proyecto</button>
+            </div>
+          ) : (
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12}}>
+              {projects.map(proj=>{
+                const pc = colors[proj.name.charCodeAt(0) % colors.length];
+                return (
+                  <div key={proj.id} onClick={()=>setOpenProject(proj)} className="fu"
+                    style={{...S.card,padding:0,cursor:"pointer",overflow:"hidden",transition:"border .2s"}}
+                    onMouseEnter={e=>e.currentTarget.style.borderColor="var(--border3)"}
+                    onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}>
+                    <div style={{height:4,background:pc}}/>
+                    <div style={{padding:"14px 16px"}}>
+                      <div style={{fontFamily:"'Syne',sans-serif",fontWeight:700,fontSize:14,marginBottom:6}}>{proj.name}</div>
+                      <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:10}}>
+                        {Object.keys(proj.modules||{}).filter(k=>proj.modules[k]).map(k=>(
+                          <Tag key={k} color={MODULE_COLORS[k]||"var(--muted2)"} small>{k}</Tag>
+                        ))}
+                        {Object.keys(proj.modules||{}).length===0&&<span style={{fontSize:11,color:"var(--muted)"}}>Sin módulos activos</span>}
+                      </div>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <span style={{fontSize:11,color:"var(--muted)"}}>{new Date(proj.createdAt).toLocaleDateString("es-AR")}</span>
+                        {proj.status&&<Tag color={proj.status==="activo"?"var(--green)":"var(--amber)"} small>{proj.status}</Tag>}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Right: Agent chat */}
+        <div style={{width:280,borderLeft:"1px solid var(--border)",display:"flex",flexDirection:"column",flexShrink:0}}>
+          <AgentChat user={user} context={`Cliente ${client.name} — ${client.industry||""} — ${client.description||""}`}/>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── CLIENTS HUB (HOME) ────────────────────────────────────────────────────────
+function ClientsHub({user, onLogout}) {
+  const [clients, setClients] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showNew, setShowNew] = useState(false);
+  const [openClient, setOpenClient] = useState(null);
+  const [search, setSearch] = useState("");
+  const [filterStatus, setFilterStatus] = useState("todos");
+  const [showChat, setShowChat] = useState(false);
+
+  useEffect(()=>{
+    (async()=>{
+      const [c, snap] = await Promise.all([fb.getClients(), getDocs(collection(db,"projects")).catch(()=>({docs:[]}))]);
+      setClients(c||[]);
+      setProjects(snap.docs?.map(d=>({id:d.id,...d.data()}))||[]);
+      setLoading(false);
+    })();
+  },[]);
+
+  const handleNewClient = async c => {
+    await fb.saveClient(c);
+    setClients(p=>[c,...p]);
+    setShowNew(false);
+    await fb.logAct({userId:user.id,userName:user.name,module:"clientes",action:`Cliente creado: ${c.name}`});
+  };
+
+  if(openClient) return <ClientView client={openClient} user={user} onBack={()=>setOpenClient(null)}/>;
+
+  const filtered = clients.filter(c=>{
+    const matchSearch = c.name.toLowerCase().includes(search.toLowerCase())||(c.industry||"").toLowerCase().includes(search.toLowerCase());
+    const matchStatus = filterStatus==="todos"||c.status===filterStatus;
+    return matchSearch&&matchStatus;
+  });
+
+  const projCountFor = id => projects.filter(p=>p.clientId===id).length;
+
+  return (
+    <div style={{height:"100vh",display:"flex",flexDirection:"column",background:"var(--bg)"}}>
+      {/* Top bar */}
+      <div style={{height:52,borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 22px",background:"var(--surface)",flexShrink:0}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:"var(--accent)",animation:"pulse 2s infinite"}}/>
+          <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16,letterSpacing:"-.025em"}}>
+            <span style={{color:"var(--accent)"}}>Aldea</span> <span style={{color:"var(--muted2)",fontWeight:400}}>Creative</span> Hub
+          </span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <Tag color={ROLES[user.role]?.color||"var(--muted)"}>{ROLES[user.role]?.icon} {ROLES[user.role]?.label}</Tag>
+          <span style={{fontSize:13,color:"var(--muted2)"}}>{user.name}</span>
+          <button onClick={()=>setShowChat(p=>!p)} style={{...S.btnS,fontSize:12,padding:"5px 10px",background:showChat?"var(--border2)":"var(--card2)"}}>💬</button>
+          <button onClick={onLogout} style={{...S.btnS,fontSize:12,padding:"5px 10px"}}>Salir</button>
+        </div>
+      </div>
+
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+        {/* Main content */}
+        <div style={{flex:1,overflowY:"auto",padding:24}}>
+          {/* Stats row */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:24}}>
+            {[
+              {label:"Clientes totales",value:clients.length,color:"var(--accent)"},
+              {label:"Activos",value:clients.filter(c=>c.status==="activo").length,color:"var(--green)"},
+              {label:"Prospectos",value:clients.filter(c=>c.status==="prospecto").length,color:"var(--amber)"},
+              {label:"Proyectos",value:projects.length,color:"var(--purple)"},
+            ].map(s=>(
+              <div key={s.label} style={{...S.card,padding:"14px 16px"}}>
+                <div style={{fontSize:22,fontFamily:"'Syne',sans-serif",fontWeight:800,color:s.color,marginBottom:2}}>{s.value}</div>
+                <div style={{fontSize:11.5,color:"var(--muted2)"}}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Search + filters + new */}
+          <div style={{display:"flex",gap:10,marginBottom:18,flexWrap:"wrap"}}>
+            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Buscar cliente..." style={{...S.inp,maxWidth:260,flex:1}}/>
+            <div style={{display:"flex",gap:6}}>
+              {["todos","activo","prospecto","pausado"].map(s=>(
+                <button key={s} onClick={()=>setFilterStatus(s)}
+                  style={{...S.btnS,fontSize:12,padding:"6px 12px",background:filterStatus===s?"var(--border2)":"var(--card2)",color:filterStatus===s?"var(--text)":"var(--muted)"}}>
+                  {s.charAt(0).toUpperCase()+s.slice(1)}
+                </button>
+              ))}
+            </div>
+            <button onClick={()=>setShowNew(true)} style={{...S.btnP(),padding:"8px 16px",fontSize:13,marginLeft:"auto"}}>+ Nuevo cliente</button>
+          </div>
+
+          {/* Clients grid */}
+          {loading ? (
+            <div style={{display:"flex",gap:8,color:"var(--muted)",padding:20,alignItems:"center"}}><Spin/>Cargando clientes...</div>
+          ) : filtered.length===0 ? (
+            <div style={{textAlign:"center",padding:"80px 20px",color:"var(--muted)"}}>
+              <div style={{fontSize:40,marginBottom:14}}>🏢</div>
+              <div style={{fontSize:15,marginBottom:8}}>{clients.length===0?"No hay clientes todavía":"Sin resultados para tu búsqueda"}</div>
+              {clients.length===0&&<button onClick={()=>setShowNew(true)} style={{...S.btnP(),padding:"10px 20px",fontSize:13}}>+ Crear primer cliente</button>}
+            </div>
+          ) : (
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>
+              {filtered.map(c=><ClientCard key={c.id} client={c} projectCount={projCountFor(c.id)} onClick={()=>setOpenClient(c)}/>)}
+            </div>
+          )}
+        </div>
+
+        {/* Agent chat panel */}
+        {showChat && (
+          <div style={{width:300,borderLeft:"1px solid var(--border)",display:"flex",flexDirection:"column",flexShrink:0}}>
+            <AgentChat user={user} context="Panel principal de la agencia — centro de clientes" onClose={()=>setShowChat(false)}/>
+          </div>
+        )}
+      </div>
+
+      {showNew && <NewClientModal onSave={handleNewClient} onClose={()=>setShowNew(false)}/>}
+    </div>
+  );
+}
+
+// ── ROOT ──────────────────────────────────────────────────────────────────────
+export default function App() {
+  const [user, setUser] = useState(null);
+  return (
     <>
-      <GlobalStyles/>
-      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",background:"var(--bg)"}}>
-        <header style={{height:52,borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 22px",background:"var(--surface)",position:"sticky",top:0,zIndex:50}}>
-          <div style={{display:"flex",alignItems:"center",gap:10}}>
-            <div style={{width:7,height:7,borderRadius:"50%",background:"var(--accent)",boxShadow:"0 0 8px var(--accent)",animation:"pulse 2s infinite"}}/>
-            <span style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:16,letterSpacing:"-.025em"}}><span style={{color:"var(--accent)"}}>Aldea</span> <span style={{color:"var(--muted2)",fontWeight:400}}>Creative</span> Hub</span>
-            {activeBrief&&<span style={{fontSize:11,color:"var(--accent)",background:"var(--accent)15",border:"1px solid var(--accent)30",borderRadius:4,padding:"2px 8px"}}>📁 {activeBrief.cliente}</span>}
-          </div>
-          <div style={{display:"flex",alignItems:"center",gap:10}}>
-            <Tag color={role?.color}>{role?.icon} {role?.label}</Tag>
-            <span style={{fontSize:13,color:"var(--muted2)"}}>{user.name}</span>
-            <button onClick={()=>setUser(null)} style={{...btnS,padding:"5px 12px",fontSize:12}}>Salir</button>
-          </div>
-        </header>
-
-        {briefMsg&&<div style={{background:"var(--accent)15",borderBottom:"1px solid var(--accent)30",padding:"8px 22px",fontSize:12.5,color:"var(--accent)",textAlign:"center"}}>{briefMsg}</div>}
-
-        <nav style={{display:"flex",borderBottom:"1px solid var(--border)",background:"var(--surface)",padding:"0 18px",gap:2,overflowX:"auto"}}>
-          {tabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{display:"flex",alignItems:"center",gap:6,padding:"12px 13px",background:"none",border:"none",borderBottom:tab===t.id?"2px solid var(--accent)":"2px solid transparent",color:tab===t.id?"var(--text)":"var(--muted)",fontSize:13,fontWeight:500,cursor:"pointer",whiteSpace:"nowrap"}}><span>{t.icon}</span><span>{t.label}</span></button>)}
-        </nav>
-
-        <main key={tab} className="fu" style={{flex:1,padding:24,maxWidth:860,width:"100%",margin:"0 auto",display:"flex",flexDirection:"column"}}>
-          {tab==="briefs"     &&<BriefsModule     user={user} briefs={briefs} onBriefsUpdate={setBriefs} onActivate={handleActivate}/>}
-          {tab==="email"      &&<EmailModule      user={user} briefs={briefs} activeBrief={activeBrief} onSelectBrief={setActiveBrief}/>}
-          {tab==="proyectos"  &&<ProyectosModule  user={user} briefs={briefs} activeBrief={activeBrief} onSelectBrief={setActiveBrief}/>}
-          {tab==="estrategia" &&<EstrategiaModule user={user} briefs={briefs} activeBrief={activeBrief} onSelectBrief={setActiveBrief}/>}
-          {tab==="campanas"   &&<CampanasModule   user={user} briefs={briefs} activeBrief={activeBrief} onSelectBrief={setActiveBrief}/>}
-          {tab==="equipo"     &&<EquipoModule     user={user}/>}
-          {tab==="historial"  &&<HistorialModule  user={user}/>}
-        </main>
-      </div>
+      <G/>
+      {user ? <ClientsHub user={user} onLogout={()=>setUser(null)}/> : <Auth onEnter={setUser}/>}
     </>
   );
 }
